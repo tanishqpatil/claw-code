@@ -71,8 +71,18 @@ mod tests {
 
         let _events = client.translate_response_chunk(chunk, &mut started_blocks);
         
+        let start_event = _events.iter().find(|e| matches!(e, StreamEvent::ContentBlockStart(_)));
+        assert!(start_event.is_some(), "Should have emitted a ContentBlockStart");
+        if let Some(StreamEvent::ContentBlockStart(ev)) = start_event {
+            if let OutputContentBlock::ToolUse { id, .. } = &ev.content_block {
+                assert!(id.contains("stream_tool"), "Tool ID should contain the tool name");
+            } else {
+                panic!("Should have been a ToolUse block");
+            }
+        }
+
         let cache = client.tool_call_cache.lock().unwrap();
-        let cached = cache.get("call_0_0").expect("Should have cached the tool call");
+        let cached = cache.get("call_0_0__@__stream_tool__@__stream-sig-456").expect("Should have cached the tool call");
         assert_eq!(cached.name, "stream_tool");
         assert_eq!(cached.thought_signature, Some("stream-sig-456".to_string()));
     }

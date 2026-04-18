@@ -1,7 +1,7 @@
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
 
-use crossterm::cursor::{MoveToColumn, RestorePosition, SavePosition};
+use crossterm::cursor::{MoveToColumn, MoveToPreviousLine, RestorePosition, SavePosition};
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{execute, queue};
@@ -42,6 +42,25 @@ impl Default for ColorTheme {
             spinner_failed: Color::Red,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusBar {
+    pub model: String,
+    pub dir: String,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub context_window: u32,
+}
+
+pub fn format_path_for_status_bar(path: &std::path::Path) -> String {
+    let home = std::env::var("HOME").ok().map(std::path::PathBuf::from);
+    if let Some(home) = home {
+        if let Ok(relative) = path.strip_prefix(&home) {
+            return format!("~/{}", relative.display());
+        }
+    }
+    path.display().to_string()
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -228,6 +247,7 @@ pub struct TerminalRenderer {
     syntax_set: SyntaxSet,
     syntax_theme: Theme,
     color_theme: ColorTheme,
+    status_bar: Option<StatusBar>,
 }
 
 impl Default for TerminalRenderer {
@@ -241,6 +261,7 @@ impl Default for TerminalRenderer {
             syntax_set,
             syntax_theme,
             color_theme: ColorTheme::default(),
+            status_bar: None,
         }
     }
 }
@@ -254,6 +275,70 @@ impl TerminalRenderer {
     #[must_use]
     pub fn color_theme(&self) -> &ColorTheme {
         &self.color_theme
+    }
+
+    pub fn set_status_bar(&mut self, model: String, dir: String, context_window: u32) {
+        self.status_bar = Some(StatusBar {
+            model,
+            dir,
+            input_tokens: 0,
+            output_tokens: 0,
+            context_window,
+        });
+    }
+
+    pub fn update_tokens<W: Write>(
+        &mut self,
+        input: u32,
+        output: u32,
+        out: &mut W,
+    ) -> io::Result<()> {
+        if let Some(ref mut bar) = self.status_bar {
+            bar.input_tokens = input;
+            bar.output_tokens = output;
+        }
+        self.render_status_bar(out)
+    }
+
+    pub fn render_status_bar<W: Write>(&self, out: &mut W) -> io::Result<()> {
+        let Some(ref bar) = self.status_bar else {
+            return Ok(());
+        };
+
+        let filled = if bar.context_window > 0 {
+            let pct = (bar.input_tokens as f64 / bar.context_window as f64).min(1.0);
+            (pct * 8.0) as usize
+        } else {
+            0
+        };
+        let ctx_bar = format!("[{}{}]", "#".repeat(filled), ".".repeat(8 - filled));
+        let pct = if bar.context_window > 0 {
+            (bar.input_tokens as f64 / bar.context_window as f64 * 100.0) as u32
+        } else {
+            0
+        };
+
+        let status = format!(
+            " 🦞 claw  {}  {}  in:{} out:{} {}{}%",
+            bar.model,
+            bar.dir,
+            bar.input_tokens,
+            bar.output_tokens,
+            ctx_bar,
+            pct
+        );
+
+        queue!(
+            out,
+            SavePosition,
+            MoveToColumn(0),
+            Clear(ClearType::CurrentLine),
+            SetForegroundColor(Color::DarkCyan),
+            Print(&status),
+            ResetColor,
+            RestorePosition
+        )?;
+        out.flush()
     }
 
     #[must_use]

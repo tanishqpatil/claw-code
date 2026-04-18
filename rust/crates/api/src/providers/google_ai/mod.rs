@@ -159,15 +159,18 @@ impl GoogleAiClient {
         }
 
         if is_expired {
+            let client_id_env = std::env::var("GEMINI_CLIENT_ID").ok();
             let client_id = creds.client_id.as_deref()
-                .or_else(|| option_env!("GEMINI_CLIENT_ID"))
+                .or_else(|| client_id_env.as_deref())
                 .ok_or_else(|| ApiError::Auth(
-                    "Missing client_id for token refresh. Add client_id to ~/.gemini/oauth_creds.json or set GEMINI_CLIENT_ID env var".to_string()
+                    "Missing client_id. Set GEMINI_CLIENT_ID in your .env or add to ~/.gemini/oauth_creds.json".to_string()
                 ))?;
+
+            let client_secret_env = std::env::var("GEMINI_CLIENT_SECRET").ok();
             let client_secret = creds.client_secret.as_deref()
-                .or_else(|| option_env!("GEMINI_CLIENT_SECRET"))
+                .or_else(|| client_secret_env.as_deref())
                 .ok_or_else(|| ApiError::Auth(
-                    "Missing client_secret for token refresh. Add client_secret to ~/.gemini/oauth_creds.json or set GEMINI_CLIENT_SECRET env var".to_string()
+                    "Missing client_secret. Set GEMINI_CLIENT_SECRET in your .env or add to ~/.gemini/oauth_creds.json".to_string()
                 ))?;
             
             let params = [

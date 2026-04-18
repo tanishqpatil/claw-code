@@ -13,3 +13,6 @@ archive/
 status-help.txt
 *.bak
 *.rot-*.jsonl
+.env
+.sandbox-*/
+rust/.claw

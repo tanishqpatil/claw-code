@@ -131,9 +131,12 @@ pub fn resolve_model_alias(model: &str) -> String {
     let trimmed = model.trim();
     let lower = trimmed.to_ascii_lowercase();
     match lower.as_str() {
-        "gemini" => return "gemini-2.5-pro".to_string(),
+        "gemini" | "gemini-pro" => return "gemini-2.5-pro".to_string(),
         "gemini-flash" => return "gemini-2.5-flash".to_string(),
-        "gemini-pro" => return "gemini-2.5-pro".to_string(),
+        "gemini-flash-lite" => return "gemini-2.5-flash-lite".to_string(),
+        "gemini-3-pro" => return "gemini-3.1-pro-preview".to_string(),
+        "gemini-3-flash" => return "gemini-3-flash-preview".to_string(),
+        "gemini-3-lite" => return "gemini-3.1-flash-lite-preview".to_string(),
         _ => {}
     }
     MODEL_REGISTRY
@@ -283,6 +286,30 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,
         }),
+        "gemini-3.1-pro-preview" => Some(ModelTokenLimit {
+            max_output_tokens: 65_536,
+            context_window_tokens: 1_000_000,
+        }),
+        "gemini-3-flash-preview" => Some(ModelTokenLimit {
+            max_output_tokens: 65_536,
+            context_window_tokens: 1_000_000,
+        }),
+        "gemini-3.1-flash-lite-preview" => Some(ModelTokenLimit {
+            max_output_tokens: 32_768,
+            context_window_tokens: 1_000_000,
+        }),
+        "gemini-2.5-pro" => Some(ModelTokenLimit {
+            max_output_tokens: 65_536,
+            context_window_tokens: 1_000_000,
+        }),
+        "gemini-2.5-flash" => Some(ModelTokenLimit {
+            max_output_tokens: 65_536,
+            context_window_tokens: 1_000_000,
+        }),
+        "gemini-2.5-flash-lite" => Some(ModelTokenLimit {
+            max_output_tokens: 32_768,
+            context_window_tokens: 1_000_000,
+        }),
         _ => None,
     }
 }
@@ -393,7 +420,7 @@ pub(crate) fn anthropic_missing_credentials() -> ApiError {
 /// ignored. Surrounding double or single quotes are stripped from the value.
 /// An optional leading `export ` prefix on the key is also stripped so files
 /// shared with shell `source` workflows still parse cleanly.
-pub(crate) fn parse_dotenv(content: &str) -> std::collections::HashMap<String, String> {
+pub fn parse_dotenv(content: &str) -> std::collections::HashMap<String, String> {
     let mut values = std::collections::HashMap::new();
     for raw_line in content.lines() {
         let line = raw_line.trim();
@@ -427,7 +454,7 @@ pub(crate) fn parse_dotenv(content: &str) -> std::collections::HashMap<String, S
 
 /// Load and parse a `.env` file from the given path. Missing files yield
 /// `None` instead of an error so callers can use this as a soft fallback.
-pub(crate) fn load_dotenv_file(
+pub fn load_dotenv_file(
     path: &std::path::Path,
 ) -> Option<std::collections::HashMap<String, String>> {
     let content = std::fs::read_to_string(path).ok()?;

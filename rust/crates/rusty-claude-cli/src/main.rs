@@ -56,8 +56,16 @@ use tools::{
     execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
 };
 
-const DEFAULT_MODEL: &str = "gemini-2.5-flash";
+fn default_model() -> String {
+    std::env::var("CLAW_DEFAULT_MODEL")
+        .unwrap_or_else(|_| "gemini-2.5-flash".to_string())
+}
 fn max_tokens_for_model(model: &str) -> u32 {
+    if let Ok(val) = std::env::var("CLAW_MAX_TOKENS") {
+        if let Ok(n) = val.parse::<u32>() {
+            return n;
+        }
+    }
     if model.contains("opus") {
         32_000
     } else {
@@ -180,6 +188,16 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Load .env file and populate std::env so all subsequent std::env::var() calls work
+    let cwd = env::current_dir()?;
+    if let Some(env_map) = api::load_dotenv_file(&cwd.join(".env")) {
+        for (k, v) in env_map {
+            if std::env::var(&k).is_err() {
+                std::env::set_var(k, v);
+            }
+        }
+    }
+
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
         CliAction::DumpManifests {
@@ -403,7 +421,7 @@ impl CliOutputFormat {
 
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    let mut model = DEFAULT_MODEL.to_string();
+    let mut model = default_model();
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
     let mut wants_help = false;
@@ -1129,7 +1147,7 @@ fn config_model_for_current_dir() -> Option<String> {
 }
 
 fn resolve_repl_model(cli_model: String) -> String {
-    if cli_model != DEFAULT_MODEL {
+    if cli_model != default_model() {
         return cli_model;
     }
     if let Some(env_model) = env::var("ANTHROPIC_MODEL")
@@ -1584,7 +1602,7 @@ fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    let model_for_tools = DEFAULT_MODEL.to_string();
+    let model_for_tools = default_model();
     let spec = McpServerSpec {
         server_name: "claw".to_string(),
         server_version: VERSION.to_string(),
@@ -4708,6 +4726,10 @@ fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 fn current_session_store() -> Result<runtime::SessionStore, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
+    if let Ok(data_dir) = std::env::var("CLAW_SESSION_DIR") {
+        return runtime::SessionStore::from_data_dir(data_dir, &cwd)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>);
+    }
     runtime::SessionStore::from_cwd(&cwd).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
@@ -6185,6 +6207,10 @@ fn short_tool_id(id: &str) -> String {
 }
 
 fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if let Ok(path) = std::env::var("CLAW_SYSTEM_PROMPT_FILE") {
+        let content = std::fs::read_to_string(path)?;
+        return Ok(vec![content]);
+    }
     Ok(load_system_prompt(
         env::current_dir()?,
         DEFAULT_DATE,
@@ -6929,12 +6955,20 @@ impl AnthropicRuntimeClient {
             })?;
         let mut stdout = io::stdout();
         let mut sink = io::sink();
-        let out: &mut dyn Write = if self.emit_output {
+        let mut out: &mut dyn Write = if self.emit_output {
             &mut stdout
         } else {
             &mut sink
         };
-        let renderer = TerminalRenderer::new();
+        let mut renderer = TerminalRenderer::new();
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cwd_display = render::format_path_for_status_bar(&cwd);
+        let context_window = api::model_token_limit(&self.model)
+            .map(|l| l.context_window_tokens)
+            .unwrap_or(0);
+        renderer.set_status_bar(self.model.clone(), cwd_display, context_window);
+        renderer.render_status_bar(&mut out)
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
         let mut markdown_stream = MarkdownStreamState::default();
         let mut events = Vec::new();
         let mut pending_tool: Option<(String, String, String)> = None;
@@ -7035,6 +7069,9 @@ impl AnthropicRuntimeClient {
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
                     events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                    renderer
+                        .update_tokens(delta.usage.input_tokens, delta.usage.output_tokens, &mut out)
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
@@ -8396,7 +8433,7 @@ mod tests {
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        PromptHistoryEntry, SlashCommand, StatusUsage, default_model, LATEST_SESSION_REFERENCE,
         STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
@@ -8697,7 +8734,7 @@ mod tests {
         assert_eq!(
             parse_args(&[]).expect("args should parse"),
             CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
+                model: default_model(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
@@ -8829,7 +8866,7 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "hello world".to_string(),
-                model: DEFAULT_MODEL.to_string(),
+                model: default_model(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -8951,7 +8988,7 @@ mod tests {
             parsed,
             CliAction::Prompt {
                 prompt: "summarize this".to_string(),
-                model: DEFAULT_MODEL.to_string(),
+                model: default_model(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -9075,7 +9112,7 @@ mod tests {
         assert_eq!(
             parse_args(&args).expect("args should parse"),
             CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
+                model: default_model(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
                 base_commit: None,
@@ -9096,7 +9133,7 @@ mod tests {
         assert_eq!(
             parsed,
             CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
+                model: default_model(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
@@ -9124,7 +9161,7 @@ mod tests {
             parsed,
             CliAction::Prompt {
                 prompt: "do the thing".to_string(),
-                model: DEFAULT_MODEL.to_string(),
+                model: default_model(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -9148,7 +9185,7 @@ mod tests {
         assert_eq!(
             parse_args(&args).expect("args should parse"),
             CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
+                model: default_model(),
                 allowed_tools: Some(
                     ["glob_search", "read_file", "write_file"]
                         .into_iter()
@@ -9254,7 +9291,7 @@ mod tests {
             .expect("skills help overview should invoke"),
             CliAction::Prompt {
                 prompt: "$help overview".to_string(),
-                model: DEFAULT_MODEL.to_string(),
+                model: default_model(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
@@ -9371,7 +9408,7 @@ mod tests {
         assert_eq!(
             parse_args(&["status".to_string()]).expect("status should parse"),
             CliAction::Status {
-                model: DEFAULT_MODEL.to_string(),
+                model: default_model(),
                 permission_mode: PermissionMode::DangerFullAccess,
                 output_format: CliOutputFormat::Text,
             }
@@ -9698,7 +9735,7 @@ mod tests {
                 .expect("prompt shorthand should still work"),
             CliAction::Prompt {
                 prompt: "help me debug".to_string(),
-                model: DEFAULT_MODEL.to_string(),
+                model: default_model(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
@@ -9766,7 +9803,7 @@ mod tests {
             .expect("/skills help overview should invoke"),
             CliAction::Prompt {
                 prompt: "$help overview".to_string(),
-                model: DEFAULT_MODEL.to_string(),
+                model: default_model(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
@@ -9793,7 +9830,7 @@ mod tests {
                 .expect("/skills /test should normalize to a single skill prompt prefix"),
             CliAction::Prompt {
                 prompt: "$test".to_string(),
-                model: DEFAULT_MODEL.to_string(),
+                model: default_model(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
@@ -10147,7 +10184,7 @@ mod tests {
         std::env::remove_var("ANTHROPIC_MODEL");
         std::env::set_var("ANTHROPIC_MODEL", "sonnet");
 
-        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+        let resolved = with_current_dir(&root, || resolve_repl_model(default_model()));
 
         assert_eq!(resolved, "claude-sonnet-4-6");
 
@@ -10166,9 +10203,9 @@ mod tests {
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_MODEL");
 
-        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+        let resolved = with_current_dir(&root, || resolve_repl_model(default_model()));
 
-        assert_eq!(resolved, DEFAULT_MODEL);
+        assert_eq!(resolved, default_model());
 
         std::env::remove_var("CLAW_CONFIG_HOME");
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -11604,7 +11641,7 @@ UU conflicted.rs",
         let mut runtime = build_runtime_with_plugin_state(
             Session::new(),
             "runtime-plugin-lifecycle",
-            DEFAULT_MODEL.to_string(),
+            default_model(),
             vec!["test system prompt".to_string()],
             true,
             false,

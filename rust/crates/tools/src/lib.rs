@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, OnceLock};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -110,6 +111,7 @@ pub struct GlobalToolRegistry {
     plugin_tools: Vec<PluginTool>,
     runtime_tools: Vec<RuntimeToolDefinition>,
     enforcer: Option<PermissionEnforcer>,
+    parent_model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,6 +129,7 @@ impl GlobalToolRegistry {
             plugin_tools: Vec::new(),
             runtime_tools: Vec::new(),
             enforcer: None,
+            parent_model: None,
         }
     }
 
@@ -153,6 +156,7 @@ impl GlobalToolRegistry {
             plugin_tools,
             runtime_tools: Vec::new(),
             enforcer: None,
+            parent_model: None,
         })
     }
 
@@ -332,13 +336,19 @@ impl GlobalToolRegistry {
         }
     }
 
+    #[must_use]
+    pub fn with_parent_model(mut self, model: String) -> Self {
+        self.parent_model = Some(model);
+        self
+    }
+
     pub fn set_enforcer(&mut self, enforcer: PermissionEnforcer) {
         self.enforcer = Some(enforcer);
     }
 
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
         if mvp_tool_specs().iter().any(|spec| spec.name == name) {
-            return execute_tool_with_enforcer(self.enforcer.as_ref(), name, input);
+            return execute_tool_with_enforcer(self.enforcer.as_ref(), name, input, self.parent_model.as_deref());
         }
         self.plugin_tools
             .iter()
@@ -1186,14 +1196,15 @@ pub fn enforce_permission_check(
     }
 }
 
-pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
-    execute_tool_with_enforcer(None, name, input)
+pub fn execute_tool(name: &str, input: &Value, parent_model: Option<&str>) -> Result<String, String> {
+    execute_tool_with_enforcer(None, name, input, parent_model)
 }
 
 fn execute_tool_with_enforcer(
     enforcer: Option<&PermissionEnforcer>,
     name: &str,
     input: &Value,
+    parent_model: Option<&str>,
 ) -> Result<String, String> {
     match name {
         "bash" => {
@@ -1227,7 +1238,7 @@ fn execute_tool_with_enforcer(
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
-        "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
+        "Agent" => from_value::<AgentInput>(input).and_then(|input| run_agent(input, parent_model)),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
         "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
@@ -1408,8 +1419,8 @@ fn run_task_packet(input: TaskPacket) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_get(input: TaskIdInput) -> Result<String, String> {
     let registry = global_task_registry();
-    match registry.get(&input.task_id) {
-        Some(task) => to_pretty_json(json!({
+    if let Some(task) = registry.get(&input.task_id) {
+        return to_pretty_json(json!({
             "task_id": task.task_id,
             "status": task.status,
             "prompt": task.prompt,
@@ -1418,15 +1429,43 @@ fn run_task_get(input: TaskIdInput) -> Result<String, String> {
             "created_at": task.created_at,
             "updated_at": task.updated_at,
             "messages": task.messages,
-            "team_id": task.team_id
-        })),
-        None => Err(format!("task not found: {}", input.task_id)),
+            "team_id": task.team_id,
+            "output": task.output
+        }));
     }
+
+    if let Ok(dir) = agent_store_dir() {
+        let manifest_path = dir.join(format!("{}.json", input.task_id));
+        if manifest_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&manifest_path) {
+                if let Ok(agent) = serde_json::from_str::<AgentOutput>(&content) {
+                    let mut output = String::new();
+                    if let Ok(md_content) = std::fs::read_to_string(&agent.output_file) {
+                        output = md_content;
+                    }
+                    return to_pretty_json(json!({
+                        "task_id": agent.agent_id,
+                        "status": agent.status,
+                        "prompt": agent.description,
+                        "description": Some(agent.description),
+                        "task_packet": None::<Value>,
+                        "created_at": agent.created_at.parse::<u64>().unwrap_or(0),
+                        "updated_at": agent.completed_at.as_deref().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                        "messages": Vec::<Value>::new(),
+                        "team_id": None::<String>,
+                        "output": output
+                    }));
+                }
+            }
+        }
+    }
+
+    Err(format!("task not found: {}", input.task_id))
 }
 
 fn run_task_list(_input: Value) -> Result<String, String> {
     let registry = global_task_registry();
-    let tasks: Vec<_> = registry
+    let mut tasks: Vec<_> = registry
         .list(None)
         .into_iter()
         .map(|t| {
@@ -1442,6 +1481,32 @@ fn run_task_list(_input: Value) -> Result<String, String> {
             })
         })
         .collect();
+
+    if let Ok(dir) = agent_store_dir() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.path().extension().and_then(|s| s.to_str()) == Some("json") {
+                    if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                        if let Ok(agent) = serde_json::from_str::<AgentOutput>(&content) {
+                            if !tasks.iter().any(|t| t["task_id"] == agent.agent_id) {
+                                tasks.push(json!({
+                                    "task_id": agent.agent_id,
+                                    "status": agent.status,
+                                    "prompt": agent.description,
+                                    "description": Some(agent.description),
+                                    "task_packet": None::<Value>,
+                                    "created_at": agent.created_at.parse::<u64>().unwrap_or(0),
+                                    "updated_at": agent.completed_at.as_deref().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                                    "team_id": None::<String>
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     to_pretty_json(json!({
         "tasks": tasks,
         "count": tasks.len()
@@ -1478,14 +1543,32 @@ fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_output(input: TaskIdInput) -> Result<String, String> {
     let registry = global_task_registry();
-    match registry.output(&input.task_id) {
-        Ok(output) => to_pretty_json(json!({
+    if let Ok(output) = registry.output(&input.task_id) {
+        return to_pretty_json(json!({
             "task_id": input.task_id,
             "output": output,
             "has_output": !output.is_empty()
-        })),
-        Err(e) => Err(e),
+        }));
     }
+
+    if let Ok(dir) = agent_store_dir() {
+        let manifest_path = dir.join(format!("{}.json", input.task_id));
+        if manifest_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&manifest_path) {
+                if let Ok(agent) = serde_json::from_str::<AgentOutput>(&content) {
+                    if let Ok(md_content) = std::fs::read_to_string(&agent.output_file) {
+                        return to_pretty_json(json!({
+                            "task_id": input.task_id,
+                            "output": md_content,
+                            "has_output": !md_content.is_empty()
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    Err(format!("task not found: {}", input.task_id))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2110,8 +2193,8 @@ fn run_skill(input: SkillInput) -> Result<String, String> {
     to_pretty_json(execute_skill(input)?)
 }
 
-fn run_agent(input: AgentInput) -> Result<String, String> {
-    to_pretty_json(execute_agent(input)?)
+fn run_agent(input: AgentInput, parent_model: Option<&str>) -> Result<String, String> {
+    to_pretty_json(execute_agent(input, parent_model)?)
 }
 
 fn run_tool_search(input: ToolSearchInput) -> Result<String, String> {
@@ -2615,6 +2698,7 @@ struct AgentJob {
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
+    parent_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -3470,15 +3554,15 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
+const DEFAULT_AGENT_MODEL: &str = "gemini-2.5-flash";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
-fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
-    execute_agent_with_spawn(input, spawn_agent_job)
+fn execute_agent(input: AgentInput, parent_model: Option<&str>) -> Result<AgentOutput, String> {
+    execute_agent_with_spawn(input, parent_model, spawn_agent_job)
 }
 
-fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOutput, String>
+fn execute_agent_with_spawn<F>(input: AgentInput, parent_model: Option<&str>, spawn_fn: F) -> Result<AgentOutput, String>
 where
     F: FnOnce(AgentJob) -> Result<(), String>,
 {
@@ -3495,7 +3579,7 @@ where
     let output_file = output_dir.join(format!("{agent_id}.md"));
     let manifest_file = output_dir.join(format!("{agent_id}.json"));
     let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
-    let model = resolve_agent_model(input.model.as_deref());
+    let model = resolve_agent_model(input.model.as_deref(), parent_model);
     let agent_name = input
         .name
         .as_deref()
@@ -3503,7 +3587,7 @@ where
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| slugify_agent_name(&input.description));
     let created_at = iso8601_now();
-    let system_prompt = build_agent_system_prompt(&normalized_subagent_type)?;
+    let system_prompt = build_agent_system_prompt(&normalized_subagent_type, &model)?;
     let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
 
     let output_contents = format!(
@@ -3548,6 +3632,7 @@ where
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
+        parent_model: parent_model.map(str::to_string),
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
@@ -3571,12 +3656,19 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                     let _ =
                         persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
                 }
-                Err(_) => {
+                Err(panic_payload) => {
+                    let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        String::from("unknown panic")
+                    };
                     let _ = persist_agent_terminal_state(
                         &job.manifest,
                         "failed",
                         None,
-                        Some(String::from("sub-agent thread panicked")),
+                        Some(format!("sub-agent thread panicked: {panic_msg}")),
                     );
                 }
             }
@@ -3585,11 +3677,32 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+
+static SUBAGENT_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+fn get_subagent_semaphore() -> Arc<tokio::sync::Semaphore> {
+    SUBAGENT_SEMAPHORE
+        .get_or_init(|| {
+            let limit = std::env::var("CLAW_MAX_SUBAGENTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1); // default: 1 at a time
+            Arc::new(tokio::sync::Semaphore::new(limit))
+        })
+        .clone()
+}
+
 fn run_agent_job(job: &AgentJob) -> Result<(), String> {
+    use std::time::SystemTime;
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+    eprintln!("[SUBAGENT {}] starting run_turn at {:?}", job.manifest.agent_id, SystemTime::now());
     let summary = runtime
         .run_turn(job.prompt.clone(), None)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            eprintln!("[SUBAGENT {}] run_turn error: {:?}", job.manifest.agent_id, error);
+            error.to_string()
+        })?;
+    eprintln!("[SUBAGENT {}] run_turn completed at {:?}", job.manifest.agent_id, SystemTime::now());
     let final_text = final_assistant_text(&summary);
     persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
 }
@@ -3597,15 +3710,16 @@ fn run_agent_job(job: &AgentJob) -> Result<(), String> {
 fn build_agent_runtime(
     job: &AgentJob,
 ) -> Result<ConversationRuntime<ProviderRuntimeClient, SubagentToolExecutor>, String> {
-    let model = job
-        .manifest
-        .model
-        .clone()
-        .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
+    // Correctly resolve the model, prioritizing the manifest's model, then the parent's, then the default.
+    let model = resolve_agent_model(
+        job.manifest.model.as_deref(),
+        job.parent_model.as_deref(),
+    );
+
     let allowed_tools = job.allowed_tools.clone();
-    let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
+    let api_client = ProviderRuntimeClient::new(model.clone(), allowed_tools.clone())?;
     let permission_policy = agent_permission_policy();
-    let tool_executor = SubagentToolExecutor::new(allowed_tools)
+    let tool_executor = SubagentToolExecutor::new(allowed_tools, model.clone())
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
     Ok(ConversationRuntime::new(
         Session::new(),
@@ -3616,13 +3730,14 @@ fn build_agent_runtime(
     ))
 }
 
-fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
+fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<String>, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     let mut prompt = load_system_prompt(
         cwd,
         DEFAULT_AGENT_SYSTEM_DATE.to_string(),
         std::env::consts::OS,
         "unknown",
+        model,
     )
     .map_err(|error| error.to_string())?;
     prompt.push(format!(
@@ -3631,12 +3746,15 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
     Ok(prompt)
 }
 
-fn resolve_agent_model(model: Option<&str>) -> String {
-    model
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .unwrap_or(DEFAULT_AGENT_MODEL)
-        .to_string()
+fn resolve_agent_model(model: Option<&str>, parent_model: Option<&str>) -> String {
+    if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        return m.to_string();
+    }
+    // Correctly use the parent model if it exists, instead of a hardcoded value.
+    if let Some(pm) = parent_model {
+        return pm.to_string();
+    }
+    DEFAULT_AGENT_MODEL.to_string()
 }
 
 fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
@@ -4506,7 +4624,6 @@ struct ProviderEntry {
 }
 
 struct ProviderRuntimeClient {
-    runtime: tokio::runtime::Runtime,
     chain: Vec<ProviderEntry>,
     allowed_tools: BTreeSet<String>,
 }
@@ -4538,7 +4655,6 @@ impl ProviderRuntimeClient {
             }
         }
         Ok(Self {
-            runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
             chain,
             allowed_tools,
         })
@@ -4578,7 +4694,6 @@ impl ApiClient for ProviderRuntimeClient {
             (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
         let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
 
-        let runtime = &self.runtime;
         let chain = &self.chain;
         let mut last_error: Option<ApiError> = None;
         for (index, entry) in chain.iter().enumerate() {
@@ -4593,7 +4708,17 @@ impl ApiClient for ProviderRuntimeClient {
                 ..Default::default()
             };
 
-            let attempt = runtime.block_on(stream_with_provider(&entry.client, &message_request));
+            // Fix for sub-agent hangs: use a fresh Runtime for EACH API call to ensure
+            // a clean sync/async bridge and avoid re-using runtimes across thread-spawns.
+            // Also acquire the sub-agent semaphore permit only during the API call itself,
+            // which prevents deadlocks when sub-agents spawn other sub-agents.
+            let runtime = tokio::runtime::Runtime::new().map_err(|e| RuntimeError::new(e.to_string()))?;
+            let attempt = runtime.block_on(async {
+                let semaphore = get_subagent_semaphore();
+                let _permit = semaphore.acquire().await.map_err(|e| ApiError::Auth(e.to_string()))?;
+                stream_with_provider(&entry.client, &message_request).await
+            });
+
             match attempt {
                 Ok(events) => return Ok(events),
                 Err(error) if error.is_retryable() && index + 1 < chain.len() => {
@@ -4701,13 +4826,15 @@ async fn stream_with_provider(
 struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
     enforcer: Option<PermissionEnforcer>,
+    parent_model: String,
 }
 
 impl SubagentToolExecutor {
-    fn new(allowed_tools: BTreeSet<String>) -> Self {
+    fn new(allowed_tools: BTreeSet<String>, parent_model: String) -> Self {
         Self {
             allowed_tools,
             enforcer: None,
+            parent_model,
         }
     }
 
@@ -4726,7 +4853,7 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
+        execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value, Some(&self.parent_model))
             .map_err(ToolError::new)
     }
 }
@@ -4739,44 +4866,55 @@ fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
-    messages
-        .iter()
-        .filter_map(|message| {
-            let role = match message.role {
-                MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
-                MessageRole::Assistant => "assistant",
-            };
-            let content = message
-                .blocks
-                .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        output,
-                        is_error,
-                        ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
-                })
-                .collect::<Vec<_>>();
-            (!content.is_empty()).then(|| InputMessage {
-                role: role.to_string(),
-                content,
+    let mut converted: Vec<InputMessage> = Vec::new();
+    for message in messages {
+        let role = match message.role {
+            MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
+            MessageRole::Assistant => "assistant",
+        };
+        let content = message
+            .blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: serde_json::from_str(input)
+                        .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    output,
+                    is_error,
+                    ..
+                } => InputContentBlock::ToolResult {
+                    tool_use_id: tool_use_id.clone(),
+                    content: vec![ToolResultContentBlock::Text {
+                        text: output.clone(),
+                    }],
+                    is_error: *is_error,
+                },
             })
-        })
-        .collect()
+            .collect::<Vec<_>>();
+
+        if content.is_empty() {
+            continue;
+        }
+
+        if let Some(last) = converted.last_mut() {
+            if last.role == role && role == "user" && message.role == MessageRole::Tool {
+                last.content.extend(content);
+                continue;
+            }
+        }
+
+        converted.push(InputMessage {
+            role: role.to_string(),
+            content,
+        });
+    }
+    converted
 }
 
 fn push_output_block(
@@ -6850,7 +6988,7 @@ mod tests {
     fn subagent_tool_executor_denies_blocked_tool_before_dispatch() {
         // given
         let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
-        let mut executor = SubagentToolExecutor::new(BTreeSet::from([String::from("write_file")]))
+        let mut executor = SubagentToolExecutor::new(BTreeSet::from([String::from("write_file")]), String::from("gemini-2.5-flash"))
             .with_enforcer(PermissionEnforcer::new(policy));
 
         // when
@@ -8433,7 +8571,7 @@ mod tests {
                 calls: 0,
                 input_path: path.display().to_string(),
             },
-            SubagentToolExecutor::new(BTreeSet::from([String::from("read_file")])),
+            SubagentToolExecutor::new(BTreeSet::from([String::from("read_file")]), String::from("gemini-2.5-flash")),
             agent_permission_policy(),
             vec![String::from("system prompt")],
         );

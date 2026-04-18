@@ -131,3 +131,27 @@ Claw Code is built in the open alongside the broader UltraWorkers toolchain:
 
 - This repository does **not** claim ownership of the original Claude Code source material.
 - This repository is **not affiliated with, endorsed by, or maintained by Anthropic**.
+
+## Using Gemini as the LLM Backend
+
+Claw Code supports Google Gemini via your existing Google AI Pro subscription.
+No separate API key required — uses the same OAuth credentials as Gemini CLI.
+
+### Prerequisites
+1. Install Gemini CLI: `npm install -g @google/gemini-cli`
+2. Authenticate: `gemini auth login` (sign in with Google AI Pro account)
+
+### Run with Gemini
+```bash
+# gemini-2.5-pro is the default model
+cd rust
+cargo build --release
+./target/release/claw prompt "summarize this repo"
+```
+
+### Model Options
+| Model | Context | Best For |
+|-------|---------|----------|
+| gemini-2.5-pro | 1,000,000 tokens | Complex multi-file tasks (Default) |
+| gemini-2.5-flash | 1,000,000 tokens | Fast iteration, simple tasks |
+| gemini-3-flash-preview | Latest | Experimental features |

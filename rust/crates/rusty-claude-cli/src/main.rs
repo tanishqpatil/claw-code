@@ -56,7 +56,7 @@ use tools::{
     execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
 };
 
-const DEFAULT_MODEL: &str = "claude-opus-4-6";
+const DEFAULT_MODEL: &str = "gemini-2.5-flash";
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
@@ -205,10 +205,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
         } => LiveCli::print_plugins(action.as_deref(), target.as_deref(), output_format)?,
         CliAction::PrintSystemPrompt {
+            model,
             cwd,
             date,
             output_format,
-        } => print_system_prompt(cwd, date, output_format)?,
+        } => print_system_prompt(&model, cwd, date, output_format)?,
         CliAction::Version { output_format } => print_version(output_format)?,
         CliAction::ResumeSession {
             session_path,
@@ -245,8 +246,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+            let mut cli = LiveCli::new(model.clone(), true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
+            
+            // Capture the model dynamically for the McpServer's tool_handler
+            let model_for_tools = cli.model.clone(); 
+
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
@@ -306,6 +311,7 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     PrintSystemPrompt {
+        model: String,
         cwd: PathBuf,
         date: String,
         output_format: CliOutputFormat,
@@ -671,7 +677,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 }),
             }
         }
-        "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
+        "system-prompt" => parse_system_prompt_args(model, &rest[1..], output_format),
         "acp" => parse_acp_args(&rest[1..], output_format),
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => Ok(CliAction::Init { output_format }),
@@ -1144,6 +1150,7 @@ fn provider_label(kind: ProviderKind) -> &'static str {
         ProviderKind::Anthropic => "anthropic",
         ProviderKind::Xai => "xai",
         ProviderKind::OpenAi => "openai",
+        ProviderKind::Google => "google",
     }
 }
 
@@ -1160,6 +1167,7 @@ fn filter_tool_specs(
 }
 
 fn parse_system_prompt_args(
+    model: String,
     args: &[String],
     output_format: CliOutputFormat,
 ) -> Result<CliAction, String> {
@@ -1188,6 +1196,7 @@ fn parse_system_prompt_args(
     }
 
     Ok(CliAction::PrintSystemPrompt {
+        model,
         cwd,
         date,
         output_format,
@@ -1575,11 +1584,12 @@ fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
+    let model_for_tools = DEFAULT_MODEL.to_string();
     let spec = McpServerSpec {
         server_name: "claw".to_string(),
         server_version: VERSION.to_string(),
         tools,
-        tool_handler: Box::new(execute_tool),
+                tool_handler: Box::new(move |name, input| execute_tool(name, input, Some(&model_for_tools))),
     };
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2117,11 +2127,12 @@ fn print_bootstrap_plan(output_format: CliOutputFormat) -> Result<(), Box<dyn st
 }
 
 fn print_system_prompt(
+    model: &str,
     cwd: PathBuf,
     date: String,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sections = load_system_prompt(cwd, date, env::consts::OS, "unknown")?;
+    let sections = load_system_prompt(cwd, date, env::consts::OS, "unknown", model)?;
     let message = sections.join(
         "
 
@@ -3646,7 +3657,7 @@ impl LiveCli {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let system_prompt = build_system_prompt()?;
+        let system_prompt = build_system_prompt(&model)?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
@@ -3771,6 +3782,9 @@ impl LiveCli {
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
+        // Clear the spinner line before streaming output begins
+        write!(stdout, "\r\x1b[2K")?;
+        stdout.flush()?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -6170,12 +6184,13 @@ fn short_tool_id(id: &str) -> String {
     format!("{prefix}…")
 }
 
-fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     Ok(load_system_prompt(
         env::current_dir()?,
         DEFAULT_DATE,
         env::consts::OS,
         "unknown",
+        model,
     )?)
 }
 
@@ -6634,6 +6649,7 @@ fn build_runtime_with_plugin_state(
         plugin_registry,
         mcp_state,
     } = runtime_plugin_state;
+    let tool_registry = tool_registry.with_parent_model(model.clone());
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
@@ -6753,7 +6769,6 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 // churning `BuiltRuntime` and every Deref/DerefMut site that references
 // it. See ROADMAP #29 for the provider-dispatch routing fix.
 struct AnthropicRuntimeClient {
-    runtime: tokio::runtime::Runtime,
     client: ApiProviderClient,
     session_id: String,
     model: String,
@@ -6803,7 +6818,7 @@ impl AnthropicRuntimeClient {
                     .with_prompt_cache(PromptCache::new(session_id));
                 ApiProviderClient::Anthropic(inner)
             }
-            ProviderKind::Xai | ProviderKind::OpenAi => {
+            ProviderKind::Xai | ProviderKind::OpenAi | ProviderKind::Google => {
                 // The api crate's `ProviderClient::from_model_with_anthropic_auth`
                 // with `None` for the anthropic auth routes via
                 // `detect_provider_kind` and builds an
@@ -6818,7 +6833,6 @@ impl AnthropicRuntimeClient {
             }
         };
         Ok(Self {
-            runtime: tokio::runtime::Runtime::new()?,
             client,
             session_id: session_id.to_string(),
             model,
@@ -6865,7 +6879,10 @@ impl ApiClient for AnthropicRuntimeClient {
             ..Default::default()
         };
 
-        self.runtime.block_on(async {
+        // Fix for sub-agent hangs: use a fresh Runtime for EACH API call to ensure
+        // a clean sync/async bridge and avoid re-using runtimes across thread-spawns.
+        let runtime = tokio::runtime::Runtime::new().map_err(|e| RuntimeError::new(e.to_string()))?;
+        runtime.block_on(async {
             // When resuming after tool execution, apply a stall timeout on the
             // first stream event.  If the model does not respond within the
             // deadline we drop the stalled connection and re-send the request as
@@ -7026,6 +7043,11 @@ impl AnthropicRuntimeClient {
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                     }
+                    // Ensure cursor is on a fresh line so spinner.finish()'s
+                    // Clear(CurrentLine) doesn't erase the last output line
+                    writeln!(out)
+                        .and_then(|()| out.flush())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
                     events.push(AssistantEvent::MessageStop);
                 }
             }
@@ -7898,7 +7920,7 @@ fn push_output_block(
         OutputContentBlock::Text { text } => {
             if !text.is_empty() {
                 let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
-                write!(out, "{rendered}")
+                writeln!(out, "{rendered}")
                     .and_then(|()| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 events.push(AssistantEvent::TextDelta(text));
@@ -8127,44 +8149,55 @@ fn permission_policy(
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
-    messages
-        .iter()
-        .filter_map(|message| {
-            let role = match message.role {
-                MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
-                MessageRole::Assistant => "assistant",
-            };
-            let content = message
-                .blocks
-                .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        output,
-                        is_error,
-                        ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
-                })
-                .collect::<Vec<_>>();
-            (!content.is_empty()).then(|| InputMessage {
-                role: role.to_string(),
-                content,
+    let mut converted: Vec<InputMessage> = Vec::new();
+    for message in messages {
+        let role = match message.role {
+            MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
+            MessageRole::Assistant => "assistant",
+        };
+        let content = message
+            .blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: serde_json::from_str(input)
+                        .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    output,
+                    is_error,
+                    ..
+                } => InputContentBlock::ToolResult {
+                    tool_use_id: tool_use_id.clone(),
+                    content: vec![ToolResultContentBlock::Text {
+                        text: output.clone(),
+                    }],
+                    is_error: *is_error,
+                },
             })
-        })
-        .collect()
+            .collect::<Vec<_>>();
+
+        if content.is_empty() {
+            continue;
+        }
+
+        if let Some(last) = converted.last_mut() {
+            if last.role == role && role == "user" && message.role == MessageRole::Tool {
+                last.content.extend(content);
+                continue;
+            }
+        }
+
+        converted.push(InputMessage {
+            role: role.to_string(),
+            content,
+        });
+    }
+    converted
 }
 
 #[allow(clippy::too_many_lines)]

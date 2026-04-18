@@ -38,8 +38,6 @@ impl From<ConfigError> for PromptBuildError {
 
 /// Marker separating static prompt scaffolding from dynamic runtime context.
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
-/// Human-readable default frontier model name embedded into generated prompts.
-pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 
@@ -100,12 +98,16 @@ pub struct SystemPromptBuilder {
     append_sections: Vec<String>,
     project_context: Option<ProjectContext>,
     config: Option<RuntimeConfig>,
+    model_name: String,
 }
 
 impl SystemPromptBuilder {
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(model_name: impl Into<String>) -> Self {
+        Self {
+            model_name: model_name.into(),
+            ..Default::default()
+        }
     }
 
     #[must_use]
@@ -149,6 +151,9 @@ impl SystemPromptBuilder {
         }
         sections.push(get_simple_system_section());
         sections.push(get_simple_doing_tasks_section());
+        if self.model_name.starts_with("gemini-") {
+            sections.push(get_questioning_protocol_section());
+        }
         sections.push(get_actions_section());
         sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
         sections.push(self.environment_section());
@@ -179,9 +184,16 @@ impl SystemPromptBuilder {
             || "unknown".to_string(),
             |context| context.current_date.clone(),
         );
+        let family = if self.model_name.starts_with("gemini-") {
+            "Gemini Pro (Google)"
+        } else if self.model_name.starts_with("claude-") {
+            "Claude Opus 4.6"
+        } else {
+            "Claw Code Agent"
+        };
         let mut lines = vec!["# Environment context".to_string()];
         lines.extend(prepend_bullets(vec![
-            format!("Model family: {FRONTIER_MODEL_NAME}"),
+            format!("Model family: {family}"),
             format!("Working directory: {cwd}"),
             format!("Date: {date}"),
             format!(
@@ -212,6 +224,9 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
     let mut files = Vec::new();
     for dir in directories {
         for candidate in [
+            dir.join("GEMINI.md"),
+            dir.join("GEMINI.local.md"),
+            dir.join(".claw").join("GEMINI.md"),
             dir.join("CLAUDE.md"),
             dir.join("CLAUDE.local.md"),
             dir.join(".claw").join("CLAUDE.md"),
@@ -293,7 +308,7 @@ fn render_project_context(project_context: &ProjectContext) -> String {
     ];
     if !project_context.instruction_files.is_empty() {
         bullets.push(format!(
-            "Claude instruction files discovered: {}.",
+            "instruction files discovered: {}.",
             project_context.instruction_files.len()
         ));
     }
@@ -328,7 +343,7 @@ fn render_project_context(project_context: &ProjectContext) -> String {
 }
 
 fn render_instruction_files(files: &[ContextFile]) -> String {
-    let mut sections = vec!["# Claude instructions".to_string()];
+    let mut sections = vec!["# Agent instructions".to_string()];
     let mut remaining_chars = MAX_TOTAL_INSTRUCTION_CHARS;
     for file in files {
         if remaining_chars == 0 {
@@ -434,11 +449,12 @@ pub fn load_system_prompt(
     current_date: impl Into<String>,
     os_name: impl Into<String>,
     os_version: impl Into<String>,
+    model_name: impl Into<String>,
 ) -> Result<Vec<String>, PromptBuildError> {
     let cwd = cwd.into();
     let project_context = ProjectContext::discover_with_git(&cwd, current_date.into())?;
     let config = ConfigLoader::default_for(&cwd).load()?;
-    Ok(SystemPromptBuilder::new()
+    Ok(SystemPromptBuilder::new(model_name)
         .with_os(os_name, os_version)
         .with_project_context(project_context)
         .with_runtime_config(config)
@@ -468,7 +484,7 @@ fn render_config_section(config: &RuntimeConfig) -> String {
 
 fn get_simple_intro_section(has_output_style: bool) -> String {
     format!(
-        "You are an interactive agent that helps users {} Use the instructions below and the tools available to you to assist the user.\n\nIMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.",
+        "You are an expert AI coding agent that helps users {} Use the instructions below and the tools available to you to assist the user.\n\nIMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.",
         if has_output_style {
             "according to your \"Output Style\" below, which describes how you should respond to user queries."
         } else {
@@ -515,6 +531,18 @@ fn get_actions_section() -> String {
         "Carefully consider reversibility and blast radius. Local, reversible actions like editing files or running tests are usually fine. Actions that affect shared systems, publish state, delete data, or otherwise have high blast radius should be explicitly authorized by the user or durable workspace instructions.".to_string(),
     ]
     .join("\n")
+}
+
+fn get_questioning_protocol_section() -> String {
+    r#"## Questioning Protocol
+You are operating as a Gemini Pro-level reasoning agent.
+Apply frontier model discipline to every task:
+- Before writing files for any new project or feature, identify ALL missing specifications (build tool, language version, package structure, database, auth, deployment target)
+- Ask ONE consolidated question covering all ambiguities
+- Wait for user response
+- Then emit a structured PLAN and wait for explicit approval
+- Only after user confirms — begin writing files
+- Never assume. A wrong assumption costs more time than one question."#.to_string()
 }
 
 #[cfg(test)]
@@ -708,7 +736,7 @@ mod tests {
         // when: discovering project context with git auto-include
         let context =
             ProjectContext::discover_with_git(&root, "2026-03-31").expect("context should load");
-        let rendered = SystemPromptBuilder::new()
+        let rendered = SystemPromptBuilder::new("gemini-2.5-pro")
             .with_os("linux", "6.8")
             .with_project_context(context.clone())
             .render();
@@ -804,7 +832,7 @@ mod tests {
         std::env::set_var("HOME", &root);
         std::env::set_var("CLAW_CONFIG_HOME", root.join("missing-home"));
         std::env::set_current_dir(&root).expect("change cwd");
-        let prompt = super::load_system_prompt(&root, "2026-03-31", "linux", "6.8")
+        let prompt = super::load_system_prompt(&root, "2026-03-31", "linux", "6.8", "gemini-2.5-pro")
             .expect("system prompt should load")
             .join(
                 "
@@ -844,7 +872,7 @@ mod tests {
         let config = ConfigLoader::new(&root, root.join("missing-home"))
             .load()
             .expect("config should load");
-        let prompt = SystemPromptBuilder::new()
+        let prompt = SystemPromptBuilder::new("gemini-2.5-pro")
             .with_output_style("Concise", "Prefer short answers.")
             .with_os("linux", "6.8")
             .with_project_context(project_context)
@@ -853,7 +881,7 @@ mod tests {
 
         assert!(prompt.contains("# System"));
         assert!(prompt.contains("# Project context"));
-        assert!(prompt.contains("# Claude instructions"));
+        assert!(prompt.contains("# Agent instructions"));
         assert!(prompt.contains("Project rules"));
         assert!(prompt.contains("permissionMode"));
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
@@ -898,7 +926,7 @@ mod tests {
             path: PathBuf::from("/tmp/project/CLAUDE.md"),
             content: "Project rules".to_string(),
         }]);
-        assert!(rendered.contains("# Claude instructions"));
+        assert!(rendered.contains("# Agent instructions"));
         assert!(rendered.contains("scope: /tmp/project"));
         assert!(rendered.contains("Project rules"));
     }

@@ -9,6 +9,7 @@ use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
 pub mod openai_compat;
+pub mod google_ai;
 
 #[allow(dead_code)]
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ApiError>> + Send + 'a>>;
@@ -33,6 +34,7 @@ pub enum ProviderKind {
     Anthropic,
     Xai,
     OpenAi,
+    Google,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +130,12 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
 pub fn resolve_model_alias(model: &str) -> String {
     let trimmed = model.trim();
     let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "gemini" => return "gemini-2.5-pro".to_string(),
+        "gemini-flash" => return "gemini-2.5-flash".to_string(),
+        "gemini-pro" => return "gemini-2.5-pro".to_string(),
+        _ => {}
+    }
     MODEL_REGISTRY
         .iter()
         .find_map(|(alias, metadata)| {
@@ -144,7 +152,7 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "grok-2" => "grok-2",
                     _ => trimmed,
                 },
-                ProviderKind::OpenAi => trimmed,
+                ProviderKind::OpenAi | ProviderKind::Google => trimmed,
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
@@ -167,6 +175,14 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             auth_env: "XAI_API_KEY",
             base_url_env: "XAI_BASE_URL",
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
+        });
+    }
+    if canonical.starts_with("gemini") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::Google,
+            auth_env: "UNUSED_OAUTH_ONLY",
+            base_url_env: "GOOGLE_BASE_URL",
+            default_base_url: google_ai::DEFAULT_GEMINI_BASE_URL,
         });
     }
     // Explicit provider-namespaced models (e.g. "openai/gpt-4.1-mini") must

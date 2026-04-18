@@ -40,6 +40,45 @@ Or provide an OAuth bearer token directly:
 export ANTHROPIC_AUTH_TOKEN="anthropic-oauth-or-proxy-bearer-token"
 ```
 
+## Google AI / Gemini Code Assist
+
+Claw supports native integration with Gemini Code Assist using OAuth2 authentication. This allows you to use Gemini models without a separate API key if you have a Google One AI Pro or Gemini Code Assist subscription.
+
+### Authentication
+Claw leverages the Google Cloud SDK for authentication. Ensure you have `gcloud` installed and run:
+
+```bash
+gcloud auth login
+gcloud auth application-default login
+```
+
+Claw will automatically invoke `gcloud` to retrieve and refresh OAuth tokens as needed.
+
+### Running with Gemini
+You can select Gemini models using the `--model` flag. If no Anthropic API key is found, Claw defaults to Gemini.
+
+```bash
+# Use the default Gemini model (gemini-2.0-flash-exp)
+claw
+
+# Explicitly select a model
+claw --model gemini-2.5-pro
+claw --model gemini-2.5-flash
+```
+
+### Requirements
+- **Google Cloud SDK**: `gcloud` must be in your PATH.
+- **Subscription**: An active Google One AI Pro or Gemini Code Assist enterprise subscription.
+
+### Model Aliases
+The following aliases are available for Gemini:
+
+| Alias | Resolves To |
+|-------|------------|
+| `gemini` | `gemini-2.5-pro` |
+| `gemini-pro` | `gemini-2.5-pro` |
+| `gemini-flash` | `gemini-2.5-flash` |
+
 ## Mock parity harness
 
 The workspace now includes a deterministic Anthropic-compatible mock service and a clean-environment CLI harness for end-to-end parity checks.

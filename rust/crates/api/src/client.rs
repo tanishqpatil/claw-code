@@ -11,6 +11,7 @@ pub enum ProviderClient {
     Anthropic(AnthropicClient),
     Xai(OpenAiCompatClient),
     OpenAi(OpenAiCompatClient),
+    Google(crate::providers::google_ai::GoogleAiClient),
 }
 
 impl ProviderClient {
@@ -43,6 +44,7 @@ impl ProviderClient {
                 };
                 Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
             }
+            ProviderKind::Google => Ok(Self::Google(crate::providers::google_ai::GoogleAiClient::new()?)),
         }
     }
 
@@ -52,6 +54,7 @@ impl ProviderClient {
             Self::Anthropic(_) => ProviderKind::Anthropic,
             Self::Xai(_) => ProviderKind::Xai,
             Self::OpenAi(_) => ProviderKind::OpenAi,
+            Self::Google(_) => ProviderKind::Google,
         }
     }
 
@@ -67,7 +70,7 @@ impl ProviderClient {
     pub fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
         match self {
             Self::Anthropic(client) => client.prompt_cache_stats(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::Google(_) => None,
         }
     }
 
@@ -75,7 +78,7 @@ impl ProviderClient {
     pub fn take_last_prompt_cache_record(&self) -> Option<PromptCacheRecord> {
         match self {
             Self::Anthropic(client) => client.take_last_prompt_cache_record(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::Google(_) => None,
         }
     }
 
@@ -86,6 +89,7 @@ impl ProviderClient {
         match self {
             Self::Anthropic(client) => client.send_message(request).await,
             Self::Xai(client) | Self::OpenAi(client) => client.send_message(request).await,
+            Self::Google(client) => client.send_message(request).await,
         }
     }
 
@@ -102,6 +106,10 @@ impl ProviderClient {
                 .stream_message(request)
                 .await
                 .map(MessageStream::OpenAiCompat),
+            Self::Google(client) => client
+                .stream_message(request)
+                .await
+                .map(MessageStream::Google),
         }
     }
 }
@@ -110,6 +118,7 @@ impl ProviderClient {
 pub enum MessageStream {
     Anthropic(anthropic::MessageStream),
     OpenAiCompat(openai_compat::MessageStream),
+    Google(crate::providers::google_ai::MessageStream),
 }
 
 impl MessageStream {
@@ -118,6 +127,7 @@ impl MessageStream {
         match self {
             Self::Anthropic(stream) => stream.request_id(),
             Self::OpenAiCompat(stream) => stream.request_id(),
+            Self::Google(_) => None,
         }
     }
 
@@ -125,6 +135,7 @@ impl MessageStream {
         match self {
             Self::Anthropic(stream) => stream.next_event().await,
             Self::OpenAiCompat(stream) => stream.next_event().await,
+            Self::Google(stream) => stream.next_event().await,
         }
     }
 }

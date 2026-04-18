@@ -78,6 +78,15 @@ impl Spinner {
         out.flush()
     }
 
+    pub fn clear(&mut self, out: &mut impl Write) -> io::Result<()> {
+        execute!(
+            out,
+            MoveToColumn(0),
+            Clear(ClearType::CurrentLine)
+        )?;
+        out.flush()
+    }
+
     pub fn finish(
         &mut self,
         label: &str,
@@ -609,7 +618,11 @@ impl MarkdownStreamState {
         let split = find_stream_safe_boundary(&self.pending)?;
         let ready = self.pending[..split].to_string();
         self.pending.drain(..split);
-        Some(renderer.markdown_to_ansi(&ready))
+        let mut rendered = renderer.markdown_to_ansi(&ready);
+        if ready.ends_with('\n') && !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        Some(rendered)
     }
 
     #[must_use]
@@ -619,7 +632,11 @@ impl MarkdownStreamState {
             None
         } else {
             let pending = std::mem::take(&mut self.pending);
-            Some(renderer.markdown_to_ansi(&pending))
+            let mut rendered = renderer.markdown_to_ansi(&pending);
+            if !rendered.ends_with('\n') {
+                rendered.push('\n');
+            }
+            Some(rendered)
         }
     }
 }
@@ -836,9 +853,7 @@ fn find_stream_safe_boundary(markdown: &str) -> Option<usize> {
             continue;
         }
 
-        if line_without_newline.trim().is_empty() {
-            last_boundary = Some(offset + line.len());
-        }
+        last_boundary = Some(offset + line.len());
     }
 
     last_boundary

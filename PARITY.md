@@ -185,3 +185,6 @@ Canonical scenario map: `rust/mock_parity_scenarios.json`
 - [x] No `#[ignore]` tests hiding failures
 - [ ] CI green on every commit
 - [x] Codebase shape clean enough for handoff documentation
+v0.1 — Signed off 2026-04-17. OAuth refresh verified. 
+Agentic flow verified. Known gaps: long session stability, 
+cloudcode-pa endpoint stability. Scope: personal daily use.

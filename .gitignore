@@ -9,4 +9,7 @@ archive/
 .claw/settings.local.json
 .claw/sessions/
 .clawhip/
+.gemini/oauth_creds.json
 status-help.txt
+*.bak
+*.rot-*.jsonl

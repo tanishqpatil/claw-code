@@ -3697,7 +3697,7 @@ fn run_agent_job(job: &AgentJob) -> Result<(), String> {
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
     eprintln!("[SUBAGENT {}] starting run_turn at {:?}", job.manifest.agent_id, SystemTime::now());
     let summary = runtime
-        .run_turn(job.prompt.clone(), None)
+        .run_turn(job.prompt.clone(), None, &mut ())
         .map_err(|error| {
             eprintln!("[SUBAGENT {}] run_turn error: {:?}", job.manifest.agent_id, error);
             error.to_string()
@@ -3721,12 +3721,40 @@ fn build_agent_runtime(
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools, model.clone())
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
+
+    let branch_name = if let Ok(cwd) = std::env::current_dir() {
+        if let Ok(_context) = runtime::ProjectContext::discover_with_git(&cwd, "unknown") {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .current_dir(&cwd)
+                .output()
+                .ok();
+            output.and_then(|o| {
+                if o.status.success() {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if s != "HEAD" && !s.is_empty() {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     Ok(ConversationRuntime::new(
         Session::new(),
         api_client,
         tool_executor,
         permission_policy,
         job.system_prompt.clone(),
+        branch_name,
     ))
 }
 
@@ -4680,7 +4708,11 @@ fn load_provider_fallback_config() -> ProviderFallbackConfig {
 }
 
 impl ApiClient for ProviderRuntimeClient {
-    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+    fn stream(
+        &mut self,
+        request: ApiRequest,
+        _context: &mut dyn std::any::Any,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
             .into_iter()
             .map(|spec| ToolDefinition {

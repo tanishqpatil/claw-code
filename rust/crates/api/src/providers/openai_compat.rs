@@ -579,7 +579,7 @@ impl StreamState {
                     output_tokens: 0,
                 }),
             }));
-            events.push(StreamEvent::MessageStop(MessageStopEvent {}));
+            events.push(StreamEvent::MessageStop(MessageStopEvent { usage: None }));
         }
         Ok(events)
     }

@@ -16,3 +16,5 @@ status-help.txt
 .env
 .sandbox-*/
 rust/.claw
+# Added by code-review-graph
+.code-review-graph/

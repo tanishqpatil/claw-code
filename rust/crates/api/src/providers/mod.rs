@@ -302,9 +302,13 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 65_536,
             context_window_tokens: 1_000_000,
         }),
-        "gemini-2.5-flash" => Some(ModelTokenLimit {
-            max_output_tokens: 65_536,
-            context_window_tokens: 1_000_000,
+        "gemini-2.5-flash" | "gemini-2.5-flash-preview-04-17" => Some(ModelTokenLimit {
+            max_output_tokens: 65536,
+            context_window_tokens: 1_048_576,
+        }),
+        "gemini-2.0-flash" => Some(ModelTokenLimit {
+            max_output_tokens: 8192,
+            context_window_tokens: 1_048_576,
         }),
         "gemini-2.5-flash-lite" => Some(ModelTokenLimit {
             max_output_tokens: 32_768,
@@ -461,12 +465,53 @@ pub fn load_dotenv_file(
     Some(parse_dotenv(&content))
 }
 
-/// Look up `key` in a `.env` file located in the current working directory.
+/// Search for a `.env` file in common locations: current directory, parent,
+/// grandparent, or the `~/.claw/.env` fallback.
+#[must_use]
+pub fn find_dotenv_path() -> Option<std::path::PathBuf> {
+    // 1. Current working directory
+    let cwd = std::env::current_dir().ok()?;
+    let p = cwd.join(".env");
+    if p.exists() {
+        return Some(p);
+    }
+
+    // 2. Parent of cwd (handles running from rust/ subdir)
+    if let Some(parent) = cwd.parent() {
+        let p = parent.join(".env");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    // 3. Grandparent (handles rust/target/release/)
+    if let Some(parent) = cwd.parent() {
+        if let Some(grandparent) = parent.parent() {
+            let p = grandparent.join(".env");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+
+    // 4. Home directory fallback
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    let p = std::path::PathBuf::from(home).join(".claw").join(".env");
+    if p.exists() {
+        return Some(p);
+    }
+
+    None
+}
+
+/// Look up `key` in a `.env` file located in the current working directory or its parents.
 /// Returns `None` when the file is missing, the key is absent, or the value
 /// is empty.
 pub(crate) fn dotenv_value(key: &str) -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    let values = load_dotenv_file(&cwd.join(".env"))?;
+    let path = find_dotenv_path()?;
+    let values = load_dotenv_file(&path)?;
     values.get(key).filter(|value| !value.is_empty()).cloned()
 }
 

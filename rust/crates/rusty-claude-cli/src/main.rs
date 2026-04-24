@@ -24,10 +24,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AuthSource,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    detect_provider_kind, find_dotenv_path, resolve_startup_auth_source, AnthropicClient,
+    AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
+    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
+    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
@@ -40,7 +41,7 @@ use commands::{
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
-use render::{MarkdownStreamState, Spinner, TerminalRenderer};
+use render::{format_path_for_status_bar, MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
     load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
@@ -189,14 +190,19 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Load .env file and populate std::env so all subsequent std::env::var() calls work
-    let cwd = env::current_dir()?;
-    if let Some(env_map) = api::load_dotenv_file(&cwd.join(".env")) {
-        for (k, v) in env_map {
-            if std::env::var(&k).is_err() {
-                std::env::set_var(k, v);
+    if let Some(path) = find_dotenv_path() {
+        if let Some(env_map) = api::load_dotenv_file(&path) {
+            for (k, v) in env_map {
+                if std::env::var(&k).is_err() {
+                    std::env::set_var(k, v);
+                }
             }
         }
     }
+
+    let cwd = env::current_dir()?;
+    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let (_, git_branch) = parse_git_status_metadata(project_context.git_status.as_deref());
 
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
@@ -264,14 +270,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            let mut cli = LiveCli::new(model.clone(), true, allowed_tools, permission_mode)?;
+            let mut cli = LiveCli::new(
+                model.clone(),
+                true,
+                allowed_tools,
+                permission_mode,
+                git_branch,
+            )?;
             cli.set_reasoning_effort(reasoning_effort);
-            
-            // Capture the model dynamically for the McpServer's tool_handler
-            let model_for_tools = cli.model.clone(); 
 
-            cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
-        }
+            // Capture the model dynamically for the McpServer's tool_handler
+            let model_for_tools = cli.model.clone();
+            let mut renderer = TerminalRenderer::new();
+            cli.run_turn_with_output(&effective_prompt, output_format, compact, &mut renderer)?;
+            }
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
@@ -295,6 +307,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
+            git_branch,
         )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
@@ -3103,18 +3116,42 @@ fn run_repl(
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
+    git_branch: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+    let mut cli = LiveCli::new(
+        resolved_model,
+        true,
+        allowed_tools,
+        permission_mode,
+        git_branch.clone(),
+    )?;
     cli.set_reasoning_effort(reasoning_effort);
+
+    let mut renderer = TerminalRenderer::new();
+    let cwd_display = format_path_for_status_bar(&env::current_dir().unwrap_or_default());
+    let context_window = api::model_token_limit(&cli.model)
+        .map(|l| l.context_window_tokens)
+        .unwrap_or(0);
+    renderer.set_status_bar(
+        cli.model.clone(),
+        git_branch.unwrap_or_else(|| "detached".to_string()),
+        cwd_display,
+        context_window,
+    );
+
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
 
+    // Initial draw of the bottom chrome
+    renderer.draw_bottom_chrome(&mut io::stderr(), "")?;
+
     loop {
+        renderer.position_input_cursor(&mut io::stderr(), 0)?;
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
@@ -3128,14 +3165,18 @@ fn run_repl(
                 }
                 match SlashCommand::parse(&trimmed) {
                     Ok(Some(command)) => {
-                        if cli.handle_repl_command(command)? {
+                        if cli.handle_repl_command(command, &mut renderer)? {
                             cli.persist_session()?;
                         }
+                        eprint!("\r\n\r\n");
+                        renderer.draw_bottom_chrome(&mut io::stderr(), "")?;
                         continue;
                     }
                     Ok(None) => {}
                     Err(error) => {
                         eprintln!("{error}");
+                        eprint!("\r\n\r\n");
+                        renderer.draw_bottom_chrome(&mut io::stderr(), "")?;
                         continue;
                     }
                 }
@@ -3146,12 +3187,18 @@ fn run_repl(
                 if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
                     editor.push_history(input);
                     cli.record_prompt_history(&trimmed);
-                    cli.run_turn(&prompt)?;
+                    cli.run_turn(&prompt, &mut renderer)?;
+                    cli.persist_session()?;
+                    eprint!("\r\n\r\n");
+                    renderer.draw_bottom_chrome(&mut io::stderr(), "")?;
                     continue;
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
+                cli.run_turn(&trimmed, &mut renderer)?;
+                cli.persist_session()?;
+                eprint!("\r\n\r\n");
+                renderer.draw_bottom_chrome(&mut io::stderr(), "")?;
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -3185,6 +3232,7 @@ struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    branch: Option<String>,
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
     session: SessionHandle,
@@ -3674,6 +3722,7 @@ impl LiveCli {
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        branch_name: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt(&model)?;
         let session_state = new_cli_session()?;
@@ -3688,11 +3737,13 @@ impl LiveCli {
             allowed_tools.clone(),
             permission_mode,
             None,
+            branch_name.clone(),
         )?;
         let cli = Self {
             model,
             allowed_tools,
             permission_mode,
+            branch: branch_name,
             system_prompt,
             runtime,
             session,
@@ -3778,6 +3829,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.branch.clone(),
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
@@ -3791,29 +3843,25 @@ impl LiveCli {
         Ok(())
     }
 
-    fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_turn(
+        &mut self,
+        input: &str,
+        renderer: &mut TerminalRenderer,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
-        spinner.tick(
-            "🦀 Thinking...",
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
+        spinner.tick("🦀 Thinking...", renderer.color_theme(), &mut stdout)?;
         // Clear the spinner line before streaming output begins
         write!(stdout, "\r\x1b[2K")?;
         stdout.flush()?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let result = runtime.run_turn(input, Some(&mut permission_prompter), renderer);
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                spinner.finish("✨ Done", renderer.color_theme(), &mut stdout)?;
                 println!();
                 if let Some(event) = summary.auto_compaction {
                     println!(
@@ -3826,11 +3874,7 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
-                spinner.fail(
-                    "❌ Request failed",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                spinner.fail("❌ Request failed", renderer.color_theme(), &mut stdout)?;
                 Err(Box::new(error))
             }
         }
@@ -3841,18 +3885,23 @@ impl LiveCli {
         input: &str,
         output_format: CliOutputFormat,
         compact: bool,
+        renderer: &mut TerminalRenderer,
     ) -> Result<(), Box<dyn std::error::Error>> {
         match output_format {
-            CliOutputFormat::Text if compact => self.run_prompt_compact(input),
-            CliOutputFormat::Text => self.run_turn(input),
-            CliOutputFormat::Json => self.run_prompt_json(input),
+            CliOutputFormat::Text if compact => self.run_prompt_compact(input, renderer),
+            CliOutputFormat::Text => self.run_turn(input, renderer),
+            CliOutputFormat::Json => self.run_prompt_json(input, renderer),
         }
     }
 
-    fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_prompt_compact(
+        &mut self,
+        input: &str,
+        renderer: &mut TerminalRenderer,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let result = runtime.run_turn(input, Some(&mut permission_prompter), renderer);
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
@@ -3862,10 +3911,14 @@ impl LiveCli {
         Ok(())
     }
 
-    fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_prompt_json(
+        &mut self,
+        input: &str,
+        renderer: &mut TerminalRenderer,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let result = runtime.run_turn(input, Some(&mut permission_prompter), renderer);
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
@@ -3904,6 +3957,7 @@ impl LiveCli {
     fn handle_repl_command(
         &mut self,
         command: SlashCommand,
+        renderer: &mut TerminalRenderer,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         Ok(match command {
             SlashCommand::Help => {
@@ -4004,7 +4058,7 @@ impl LiveCli {
             }
             SlashCommand::Skills { args } => {
                 match classify_skills_slash_command(args.as_deref()) {
-                    SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt)?,
+                    SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt, renderer)?,
                     SkillSlashDispatch::Local => {
                         Self::print_skills(args.as_deref(), CliOutputFormat::Text)?;
                     }
@@ -4200,6 +4254,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.branch.clone(),
         )?;
         self.replace_runtime(runtime)?;
         self.model.clone_from(&model);
@@ -4246,6 +4301,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.branch.clone(),
         )?;
         self.replace_runtime(runtime)?;
         println!(
@@ -4276,6 +4332,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.branch.clone(),
         )?;
         self.replace_runtime(runtime)?;
         println!(
@@ -4317,6 +4374,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.branch.clone(),
         )?;
         self.replace_runtime(runtime)?;
         self.session = SessionHandle {
@@ -4473,6 +4531,7 @@ impl LiveCli {
                     self.allowed_tools.clone(),
                     self.permission_mode,
                     None,
+                    self.branch.clone(),
                 )?;
                 self.replace_runtime(runtime)?;
                 self.session = SessionHandle {
@@ -4508,6 +4567,7 @@ impl LiveCli {
                     self.allowed_tools.clone(),
                     self.permission_mode,
                     None,
+                    branch_name.clone(),
                 )?;
                 self.replace_runtime(runtime)?;
                 self.session = handle;
@@ -4604,6 +4664,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.branch.clone(),
         )?;
         self.replace_runtime(runtime)?;
         self.persist_session()
@@ -4624,6 +4685,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.branch.clone(),
         )?;
         self.replace_runtime(runtime)?;
         self.persist_session()?;
@@ -4648,9 +4710,10 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             progress,
+            self.branch.clone(),
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
+        let summary = runtime.run_turn(prompt, Some(&mut permission_prompter), &mut ())?;
         let text = final_assistant_text(&summary).trim().to_string();
         runtime.shutdown_plugins()?;
         Ok(text)
@@ -6635,6 +6698,7 @@ fn build_runtime(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    branch_name: Option<String>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let runtime_plugin_state = build_runtime_plugin_state()?;
     build_runtime_with_plugin_state(
@@ -6648,6 +6712,7 @@ fn build_runtime(
         permission_mode,
         progress_reporter,
         runtime_plugin_state,
+        branch_name,
     )
 }
 
@@ -6664,6 +6729,7 @@ fn build_runtime_with_plugin_state(
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
     runtime_plugin_state: RuntimePluginState,
+    branch_name: Option<String>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     // Persist the model in session metadata so resumed sessions can report it.
     if session.model.is_none() {
@@ -6699,6 +6765,7 @@ fn build_runtime_with_plugin_state(
         policy,
         system_prompt,
         &feature_config,
+        branch_name,
     );
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
@@ -6886,7 +6953,11 @@ fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
 
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
-    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+    fn stream(
+        &mut self,
+        request: ApiRequest,
+        context: &mut dyn std::any::Any,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
@@ -6905,6 +6976,10 @@ impl ApiClient for AnthropicRuntimeClient {
             ..Default::default()
         };
 
+        let renderer = context
+            .downcast_mut::<TerminalRenderer>()
+            .expect("context should be a TerminalRenderer");
+
         // Fix for sub-agent hangs: use a fresh Runtime for EACH API call to ensure
         // a clean sync/async bridge and avoid re-using runtimes across thread-spawns.
         let runtime = tokio::runtime::Runtime::new().map_err(|e| RuntimeError::new(e.to_string()))?;
@@ -6917,7 +6992,7 @@ impl ApiClient for AnthropicRuntimeClient {
 
             for attempt in 1..=max_attempts {
                 let result = self
-                    .consume_stream(&message_request, is_post_tool && attempt == 1)
+                    .consume_stream(&message_request, is_post_tool && attempt == 1, renderer)
                     .await;
                 match result {
                     Ok(events) => return Ok(events),
@@ -6945,6 +7020,7 @@ impl AnthropicRuntimeClient {
         &self,
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
+        renderer: &mut TerminalRenderer,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let mut stream = self
             .client
@@ -6955,20 +7031,14 @@ impl AnthropicRuntimeClient {
             })?;
         let mut stdout = io::stdout();
         let mut sink = io::sink();
-        let mut out: &mut dyn Write = if self.emit_output {
+        let out: &mut dyn Write = if self.emit_output {
             &mut stdout
         } else {
             &mut sink
         };
-        let mut renderer = TerminalRenderer::new();
+
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let cwd_display = render::format_path_for_status_bar(&cwd);
-        let context_window = api::model_token_limit(&self.model)
-            .map(|l| l.context_window_tokens)
-            .unwrap_or(0);
-        renderer.set_status_bar(self.model.clone(), cwd_display, context_window);
-        renderer.render_status_bar(&mut out)
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let _cwd_display = render::format_path_for_status_bar(&cwd);
         let mut markdown_stream = MarkdownStreamState::default();
         let mut events = Vec::new();
         let mut pending_tool: Option<(String, String, String)> = None;
@@ -7009,6 +7079,7 @@ impl AnthropicRuntimeClient {
                             &mut pending_tool,
                             true,
                             &mut block_has_thinking_summary,
+                            renderer,
                         )?;
                     }
                 }
@@ -7020,6 +7091,7 @@ impl AnthropicRuntimeClient {
                         &mut pending_tool,
                         true,
                         &mut block_has_thinking_summary,
+                        renderer,
                     )?;
                 }
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
@@ -7028,7 +7100,7 @@ impl AnthropicRuntimeClient {
                             if let Some(progress_reporter) = &self.progress_reporter {
                                 progress_reporter.mark_text_phase(&text);
                             }
-                            if let Some(rendered) = markdown_stream.push(&renderer, &text) {
+                            if let Some(rendered) = markdown_stream.push(renderer, &text) {
                                 write!(out, "{rendered}")
                                     .and_then(|()| out.flush())
                                     .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -7051,7 +7123,7 @@ impl AnthropicRuntimeClient {
                 },
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
-                    if let Some(rendered) = markdown_stream.flush(&renderer) {
+                    if let Some(rendered) = markdown_stream.flush(renderer) {
                         write!(out, "{rendered}")
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -7069,22 +7141,19 @@ impl AnthropicRuntimeClient {
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
                     events.push(AssistantEvent::Usage(delta.usage.token_usage()));
-                    renderer
-                        .update_tokens(delta.usage.input_tokens, delta.usage.output_tokens, &mut out)
-                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    renderer.store_tokens(delta.usage.input_tokens, delta.usage.output_tokens);
                 }
-                ApiStreamEvent::MessageStop(_) => {
+                ApiStreamEvent::MessageStop(stop) => {
                     saw_stop = true;
-                    if let Some(rendered) = markdown_stream.flush(&renderer) {
+                    if let Some(usage) = stop.usage {
+                        events.push(AssistantEvent::Usage(usage.token_usage()));
+                        renderer.store_tokens(usage.input_tokens, usage.output_tokens);
+                    }
+                    if let Some(rendered) = markdown_stream.flush(renderer) {
                         write!(out, "{rendered}")
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                     }
-                    // Ensure cursor is on a fresh line so spinner.finish()'s
-                    // Clear(CurrentLine) doesn't erase the last output line
-                    writeln!(out)
-                        .and_then(|()| out.flush())
-                        .map_err(|error| RuntimeError::new(error.to_string()))?;
                     events.push(AssistantEvent::MessageStop);
                 }
             }
@@ -7118,7 +7187,7 @@ impl AnthropicRuntimeClient {
             .map_err(|error| {
                 RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
             })?;
-        let mut events = response_to_events(response, out)?;
+        let mut events = response_to_events(response, out, renderer)?;
         push_prompt_cache_record(&self.client, &mut events);
         Ok(events)
     }
@@ -7952,11 +8021,12 @@ fn push_output_block(
     pending_tool: &mut Option<(String, String, String)>,
     streaming_tool_input: bool,
     block_has_thinking_summary: &mut bool,
+    renderer: &TerminalRenderer,
 ) -> Result<(), RuntimeError> {
     match block {
         OutputContentBlock::Text { text } => {
             if !text.is_empty() {
-                let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
+                let rendered = renderer.markdown_to_ansi(&text);
                 writeln!(out, "{rendered}")
                     .and_then(|()| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -7992,6 +8062,7 @@ fn push_output_block(
 fn response_to_events(
     response: MessageResponse,
     out: &mut (impl Write + ?Sized),
+    renderer: &TerminalRenderer,
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
@@ -8005,6 +8076,7 @@ fn response_to_events(
             &mut pending_tool,
             false,
             &mut block_has_thinking_summary,
+            renderer,
         )?;
         if let Some((id, name, input)) = pending_tool.take() {
             events.push(AssistantEvent::ToolUse { id, name, input });
@@ -8188,6 +8260,9 @@ fn permission_policy(
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
     let mut converted: Vec<InputMessage> = Vec::new();
     for message in messages {
+        if message.role == MessageRole::System {
+            continue;
+        }
         let role = match message.role {
             MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
             MessageRole::Assistant => "assistant",

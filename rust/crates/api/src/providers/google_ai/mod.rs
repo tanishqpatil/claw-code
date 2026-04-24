@@ -115,14 +115,29 @@ fn sanitize_schema(schema: &mut Value) {
 
 impl GoogleAiClient {
     pub fn new() -> Result<Self, ApiError> {
-        let creds_path = std::env::var("GOOGLE_OAUTH_CREDS_FILE").unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-            format!("{}/.gemini/oauth_creds.json", home)
-        });
+        let creds_path = match std::env::var("GOOGLE_OAUTH_CREDS_FILE") {
+            Ok(path) => PathBuf::from(path),
+            Err(_) => {
+                let home_dir = std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .or_else(|_| std::env::var("CLAW_CONFIG_HOME"))
+                    .map_err(|_| {
+                        ApiError::Auth(
+                            "Could not determine home directory for gemini config. \
+                             Set HOME, USERPROFILE, or CLAW_CONFIG_HOME environment variable."
+                                .to_string(),
+                        )
+                    })?;
+                let mut path = PathBuf::from(home_dir);
+                path.push(".gemini");
+                path.push("oauth_creds.json");
+                path
+            }
+        };
 
         Ok(Self {
             client: build_http_client_or_default(),
-            creds_path: PathBuf::from(creds_path),
+            creds_path,
             creds: Arc::new(tokio::sync::Mutex::new(None)),
             project_id: Arc::new(tokio::sync::Mutex::new(None)),
             tool_call_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -784,7 +799,7 @@ impl GoogleAiClient {
                 }
             }
             
-            yield Ok(StreamEvent::MessageStop(MessageStopEvent {}));
+            yield Ok(StreamEvent::MessageStop(MessageStopEvent { usage: None }));
         };
 
         Ok(MessageStream {

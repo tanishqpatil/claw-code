@@ -1,8 +1,8 @@
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
 
-use crossterm::cursor::{MoveToColumn, MoveToPreviousLine, RestorePosition, SavePosition};
-use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
+use crossterm::cursor::{MoveTo, MoveToColumn, MoveToPreviousLine, RestorePosition, SavePosition};
+use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor, Stylize};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{execute, queue};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -47,6 +47,7 @@ impl Default for ColorTheme {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusBar {
     pub model: String,
+    pub branch: String,
     pub dir: String,
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -54,7 +55,10 @@ pub struct StatusBar {
 }
 
 pub fn format_path_for_status_bar(path: &std::path::Path) -> String {
-    let home = std::env::var("HOME").ok().map(std::path::PathBuf::from);
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .map(std::path::PathBuf::from);
     if let Some(home) = home {
         if let Ok(relative) = path.strip_prefix(&home) {
             return format!("~/{}", relative.display());
@@ -277,9 +281,10 @@ impl TerminalRenderer {
         &self.color_theme
     }
 
-    pub fn set_status_bar(&mut self, model: String, dir: String, context_window: u32) {
+    pub fn set_status_bar(&mut self, model: String, branch: String, dir: String, context_window: u32) {
         self.status_bar = Some(StatusBar {
             model,
+            branch,
             dir,
             input_tokens: 0,
             output_tokens: 0,
@@ -287,58 +292,106 @@ impl TerminalRenderer {
         });
     }
 
-    pub fn update_tokens<W: Write>(
-        &mut self,
-        input: u32,
-        output: u32,
-        out: &mut W,
+    pub fn draw_bottom_chrome(
+        &self,
+        out: &mut impl Write,
+        _input_buf: &str,
     ) -> io::Result<()> {
+        let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+        let w = width as usize;
+
+        // ── Row height-1: divider ─────────────────────────────────
+        let mut divider = "─".repeat(w);
+        if divider.len() >= 3 {
+            divider.replace_range(..3, "── ");
+        }
+
+        // ── Row height: info bar ──────────────────────────────────
+        let (model, branch, _, _, ctx_win) = if let Some(ref bar) = self.status_bar {
+            let filled = if bar.context_window > 0 {
+                let pct = (bar.input_tokens as f64 / bar.context_window as f64).min(1.0);
+                (pct * 8.0) as usize
+            } else { 0 };
+            let ctx = format!("[{}{}]", "█".repeat(filled), "░".repeat(8 - filled));
+            let pct = if bar.context_window > 0 {
+                (bar.input_tokens as f64 / bar.context_window as f64 * 100.0) as u32
+            } else { 0 };
+            (
+                bar.model.clone(),
+                bar.branch.clone(),
+                bar.input_tokens,
+                bar.output_tokens,
+                format!("{} {}%  in:{} out:{}", ctx, pct, bar.input_tokens, bar.output_tokens)
+            )
+        } else {
+            ("".into(), "".into(), 0, 0, "".into())
+        };
+
+        // Left: branch   Center: context   Right: model
+        let left  = format!(" ⎇ {}", branch);
+        let right = format!("{}  ", model);
+        let mid   = ctx_win;
+        let total_lr = left.chars().count() + right.chars().count();
+        let mid_pad = if w > total_lr + mid.chars().count() {
+            (w - total_lr - mid.chars().count()) / 2
+        } else { 1 };
+        let info_bar = format!("{}{:^pad$}{}{:>rpad$}",
+            left,
+            mid, "",
+            right,
+            pad = mid_pad + mid.chars().count(),
+            rpad = right.chars().count()
+        );
+        let info_bar_display: String = info_bar.chars().take(w).collect();
+        let info_bar_padded = format!("{:<width$}", info_bar_display, width = w);
+
+        queue!(
+            out,
+            // Move to bottom rows directly — no SavePosition/RestorePosition
+            // Divider
+            MoveTo(0, height.saturating_sub(2)),
+            Clear(ClearType::CurrentLine),
+            SetForegroundColor(Color::DarkGrey),
+            Print(&divider),
+            // Info bar
+            MoveTo(0, height.saturating_sub(1)),
+            Clear(ClearType::CurrentLine),
+            SetForegroundColor(Color::Cyan),
+            Print(&info_bar_padded),
+            ResetColor,
+            // Put cursor on input row ABOVE chrome (column 0 for readline prompt)
+            MoveTo(0, height.saturating_sub(3)),
+        )?;
+        out.flush()
+    }
+
+    /// Call after drawing chrome to place cursor in input row.
+    pub fn position_input_cursor(
+        &self,
+        out: &mut impl Write,
+        _input_len: usize,
+    ) -> io::Result<()> {
+        let (_, height) = crossterm::terminal::size().unwrap_or((80, 24));
+        // Start at column 0 so the readline prompt "> " is correctly placed
+        queue!(out, MoveTo(0, height.saturating_sub(3)))?;
+        out.flush()
+    }
+
+    pub fn store_tokens(&mut self, input: u32, output: u32) {
         if let Some(ref mut bar) = self.status_bar {
             bar.input_tokens = input;
             bar.output_tokens = output;
         }
-        self.render_status_bar(out)
     }
 
-    pub fn render_status_bar<W: Write>(&self, out: &mut W) -> io::Result<()> {
-        let Some(ref bar) = self.status_bar else {
-            return Ok(());
-        };
-
-        let filled = if bar.context_window > 0 {
-            let pct = (bar.input_tokens as f64 / bar.context_window as f64).min(1.0);
-            (pct * 8.0) as usize
-        } else {
-            0
-        };
-        let ctx_bar = format!("[{}{}]", "#".repeat(filled), ".".repeat(8 - filled));
-        let pct = if bar.context_window > 0 {
-            (bar.input_tokens as f64 / bar.context_window as f64 * 100.0) as u32
-        } else {
-            0
-        };
-
-        let status = format!(
-            " 🦞 claw  {}  {}  in:{} out:{} {}{}%",
-            bar.model,
-            bar.dir,
-            bar.input_tokens,
-            bar.output_tokens,
-            ctx_bar,
-            pct
-        );
-
-        queue!(
-            out,
-            SavePosition,
-            MoveToColumn(0),
-            Clear(ClearType::CurrentLine),
-            SetForegroundColor(Color::DarkCyan),
-            Print(&status),
-            ResetColor,
-            RestorePosition
-        )?;
-        out.flush()
+    pub fn update_tokens<W: Write>(
+        &mut self,
+        input: u32,
+        output: u32,
+        _out: &mut W,
+    ) -> io::Result<()> {
+        self.store_tokens(input, output);
+        Ok(())
     }
 
     #[must_use]

@@ -51,7 +51,11 @@ pub struct PromptCacheEvent {
 
 /// Minimal streaming API contract required by [`ConversationRuntime`].
 pub trait ApiClient {
-    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>;
+    fn stream(
+        &mut self,
+        request: ApiRequest,
+        context: &mut dyn std::any::Any,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError>;
 }
 
 /// Trait implemented by tool dispatchers that execute model-requested tools.
@@ -129,6 +133,7 @@ pub struct ConversationRuntime<C, T> {
     tool_executor: T,
     permission_policy: PermissionPolicy,
     system_prompt: Vec<String>,
+    pub branch_name: Option<String>,
     max_iterations: usize,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
@@ -150,6 +155,7 @@ where
         tool_executor: T,
         permission_policy: PermissionPolicy,
         system_prompt: Vec<String>,
+        branch_name: Option<String>,
     ) -> Self {
         Self::new_with_features(
             session,
@@ -158,6 +164,7 @@ where
             permission_policy,
             system_prompt,
             &RuntimeFeatureConfig::default(),
+            branch_name,
         )
     }
 
@@ -170,6 +177,7 @@ where
         permission_policy: PermissionPolicy,
         system_prompt: Vec<String>,
         feature_config: &RuntimeFeatureConfig,
+        branch_name: Option<String>,
     ) -> Self {
         let usage_tracker = UsageTracker::from_session(&session);
         Self {
@@ -178,6 +186,7 @@ where
             tool_executor,
             permission_policy,
             system_prompt,
+            branch_name,
             max_iterations: usize::MAX,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
@@ -315,6 +324,7 @@ where
         &mut self,
         user_input: impl Into<String>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
+        context: &mut dyn std::any::Any,
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
 
@@ -353,7 +363,7 @@ where
                 system_prompt: self.system_prompt.clone(),
                 messages: self.session.messages.clone(),
             };
-            let events = match self.api_client.stream(request) {
+            let events = match self.api_client.stream(request, context) {
                 Ok(events) => events,
                 Err(error) => {
                     self.record_turn_failed(iterations, &error);

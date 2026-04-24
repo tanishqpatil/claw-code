@@ -316,7 +316,8 @@ fn render_project_context(project_context: &ProjectContext) -> String {
     if let Some(status) = &project_context.git_status {
         lines.push(String::new());
         lines.push("Git status snapshot:".to_string());
-        lines.push(status.clone());
+        let status_truncated = status.chars().take(10_000).collect::<String>();
+        lines.push(status_truncated);
     }
     if let Some(ref gc) = project_context.git_context {
         if !gc.recent_commits.is_empty() {
@@ -330,7 +331,8 @@ fn render_project_context(project_context: &ProjectContext) -> String {
     if let Some(diff) = &project_context.git_diff {
         lines.push(String::new());
         lines.push("Git diff snapshot:".to_string());
-        lines.push(diff.clone());
+        let diff_truncated = diff.chars().take(10_000).collect::<String>();
+        lines.push(diff_truncated);
     }
     if let Some(git_context) = &project_context.git_context {
         let rendered = git_context.render();

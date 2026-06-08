@@ -121,7 +121,7 @@ mod tests {
             presence_penalty: None,
             stop: None,
             reasoning_effort: None,
-            extra_body: None,
+            extra_body: Default::default(),
         };
 
         let payload = client.translate_request(&request, "test-project").unwrap();
@@ -165,7 +165,7 @@ mod tests {
             presence_penalty: None,
             stop: None,
             reasoning_effort: None,
-            extra_body: None,
+            extra_body: Default::default(),
         };
 
         let payload = client.translate_request(&request, "test-project").unwrap();

@@ -414,7 +414,7 @@ impl TerminalRenderer {
             );
         }
 
-        output.trim_end().to_string()
+        output.trim_end_matches(|c| c == '\n' || c == '\r').to_string()
     }
 
     #[must_use]

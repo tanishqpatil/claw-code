@@ -5546,6 +5546,9 @@ fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
     let mut converted: Vec<InputMessage> = Vec::new();
     for message in messages {
+        if message.role == MessageRole::System {
+            continue;
+        }
         let role = match message.role {
             MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
             MessageRole::Assistant => "assistant",
@@ -7009,7 +7012,7 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
-        classify_lane_failure, derive_agent_state, execute_agent_with_spawn, execute_tool,
+        classify_lane_failure, derive_agent_state, execute_agent_with_spawn,
         extract_recovery_outcome, final_assistant_text, global_cron_registry,
         maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
@@ -7023,6 +7026,10 @@ mod tests {
         PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
     };
     use serde_json::json;
+
+    fn execute_tool(name: &str, input: &serde_json::Value) -> Result<String, String> {
+        super::execute_tool(name, input, None)
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -8869,7 +8876,8 @@ mod tests {
                 name: Some("ship-audit".to_string()),
                 model: None,
             },
-            move |job| {
+            None,
+move |job| {
                 *captured_for_spawn
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job);
@@ -8950,7 +8958,8 @@ mod tests {
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
             },
-            |job| {
+            None,
+|job| {
                 persist_agent_terminal_state(
                     &job.manifest,
                     "completed",
@@ -9007,7 +9016,8 @@ mod tests {
                 name: Some("fail-task".to_string()),
                 model: None,
             },
-            |job| {
+            None,
+|job| {
                 persist_agent_terminal_state(
                     &job.manifest,
                     "failed",
@@ -9054,7 +9064,8 @@ mod tests {
                 name: Some("summary-floor".to_string()),
                 model: None,
             },
-            |job| {
+            None,
+|job| {
                 persist_agent_terminal_state(
                     &job.manifest,
                     "completed",
@@ -9099,7 +9110,8 @@ mod tests {
                 name: Some("recovery-lane".to_string()),
                 model: None,
             },
-            |job| {
+            None,
+|job| {
                 persist_agent_terminal_state(
                     &job.manifest,
                     "completed",
@@ -9147,7 +9159,8 @@ mod tests {
                 name: Some("review-lane".to_string()),
                 model: None,
             },
-            |job| {
+            None,
+|job| {
                 persist_agent_terminal_state(
                     &job.manifest,
                     "completed",
@@ -9187,7 +9200,8 @@ mod tests {
                 name: Some("backlog-scan".to_string()),
                 model: None,
             },
-            |job| {
+            None,
+|job| {
                 persist_agent_terminal_state(
                     &job.manifest,
                     "completed",
@@ -9233,7 +9247,8 @@ mod tests {
                 name: Some("artifact-lane".to_string()),
                 model: None,
             },
-            |job| {
+            None,
+|job| {
                 persist_agent_terminal_state(
                     &job.manifest,
                     "completed",
@@ -9303,7 +9318,8 @@ mod tests {
                 name: Some("cron-closeout".to_string()),
                 model: None,
             },
-            |job| {
+            None,
+|job| {
                 persist_agent_terminal_state(
                     &job.manifest,
                     "completed",
@@ -9344,7 +9360,8 @@ mod tests {
                 name: Some("spawn-error".to_string()),
                 model: None,
             },
-            |_| Err(String::from("thread creation failed")),
+            None,
+|_| Err(String::from("thread creation failed")),
         )
         .expect_err("spawn errors should surface");
         assert!(spawn_error.contains("failed to spawn sub-agent"));
@@ -9551,7 +9568,7 @@ mod tests {
     }
 
     impl runtime::ApiClient for MockSubagentApiClient {
-        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        fn stream(&mut self, request: ApiRequest, _context: &mut dyn std::any::Any) -> Result<Vec<AssistantEvent>, RuntimeError> {
             self.calls += 1;
             match self.calls {
                 1 => {
@@ -9598,6 +9615,7 @@ mod tests {
             SubagentToolExecutor::new(BTreeSet::from([String::from("read_file")]), String::from("gemini-2.5-flash")),
             agent_permission_policy(),
             vec![String::from("system prompt")],
+            None,
         );
 
         let summary = runtime

@@ -327,4 +327,14 @@ mod tests {
             }))
         );
     }
+
+    #[test]
+    fn test_vllm_message_start_deserialization() {
+        let frame = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"chatcmpl-a1235c20da526a6c\",\"content\":[],\"model\":\"/Users/tanishq/.lmstudio/models/lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit\",\"stop_reason\":null,\"stop_sequence\":null}}\n\n"
+        );
+        let event = parse_frame(frame).expect("frame should parse");
+        assert!(event.is_some());
+    }
 }

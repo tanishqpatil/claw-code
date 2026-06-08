@@ -132,11 +132,20 @@ pub enum ToolChoice {
     Tool { name: String },
 }
 
+fn default_message_type() -> String {
+    "message".to_string()
+}
+
+fn default_message_role() -> String {
+    "assistant".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageResponse {
     pub id: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "default_message_type")]
     pub kind: String,
+    #[serde(default = "default_message_role")]
     pub role: String,
     pub content: Vec<OutputContentBlock>,
     pub model: String,

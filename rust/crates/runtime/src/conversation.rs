@@ -857,6 +857,45 @@ impl ToolExecutor for StaticToolExecutor {
 
 #[cfg(test)]
 mod tests {
+    trait TestRuntimeExt {
+        fn run_turn_test(
+            &mut self,
+            user_input: &str,
+            prompter: Option<&mut dyn PermissionPrompter>,
+        ) -> Result<crate::TurnSummary, RuntimeError>;
+    }
+
+    impl<C: ApiClient, T: ToolExecutor> TestRuntimeExt for ConversationRuntime<C, T> {
+        fn run_turn_test(
+            &mut self,
+            user_input: &str,
+            prompter: Option<&mut dyn PermissionPrompter>,
+        ) -> Result<crate::TurnSummary, RuntimeError> {
+            self.run_turn(user_input, prompter, &mut ())
+        }
+    }
+
+    fn new_test_runtime<A: ApiClient + 'static, T: ToolExecutor + 'static>(
+        session: Session,
+        api: A,
+        tool_executor: T,
+        permission_policy: PermissionPolicy,
+        system_prompts: Vec<String>,
+    ) -> ConversationRuntime<A, T> {
+        ConversationRuntime::new(session, api, tool_executor, permission_policy, system_prompts, None)
+    }
+
+    fn new_test_runtime_with_features<A: ApiClient + 'static, T: ToolExecutor + 'static>(
+        session: Session,
+        api: A,
+        tool_executor: T,
+        permission_policy: PermissionPolicy,
+        system_prompts: Vec<String>,
+        features: &RuntimeFeatureConfig,
+    ) -> ConversationRuntime<A, T> {
+        ConversationRuntime::new_with_features(session, api, tool_executor, permission_policy, system_prompts, features, None)
+    }
+
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
@@ -883,7 +922,7 @@ mod tests {
     }
 
     impl ApiClient for ScriptedApiClient {
-        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        fn stream(&mut self, request: ApiRequest, _context: &mut dyn std::any::Any) -> Result<Vec<AssistantEvent>, RuntimeError> {
             self.call_count += 1;
             match self.call_count {
                 1 => {
@@ -958,7 +997,7 @@ mod tests {
             Ok(total.to_string())
         });
         let permission_policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite);
-        let system_prompt = SystemPromptBuilder::new()
+        let system_prompt = SystemPromptBuilder::new("test-model")
             .with_project_context(ProjectContext {
                 cwd: PathBuf::from("/tmp/project"),
                 current_date: "2026-03-31".to_string(),
@@ -969,7 +1008,7 @@ mod tests {
             })
             .with_os("linux", "6.8")
             .build();
-        let mut runtime = ConversationRuntime::new(
+        let mut runtime = new_test_runtime(
             Session::new(),
             api_client,
             tool_executor,
@@ -978,7 +1017,7 @@ mod tests {
         );
 
         let summary = runtime
-            .run_turn("what is 2 + 2?", Some(&mut PromptAllowOnce))
+            .run_turn_test("what is 2 + 2?", Some(&mut PromptAllowOnce))
             .expect("conversation loop should succeed");
 
         assert_eq!(summary.iterations, 2);
@@ -1005,7 +1044,7 @@ mod tests {
     fn records_runtime_session_trace_events() {
         let sink = Arc::new(MemoryTelemetrySink::default());
         let tracer = SessionTracer::new("session-runtime", sink.clone());
-        let mut runtime = ConversationRuntime::new(
+        let mut runtime = new_test_runtime(
             Session::new(),
             ScriptedApiClient { call_count: 0 },
             StaticToolExecutor::new().register("add", |_input| Ok("4".to_string())),
@@ -1015,7 +1054,7 @@ mod tests {
         .with_session_tracer(tracer);
 
         runtime
-            .run_turn("what is 2 + 2?", Some(&mut PromptAllowOnce))
+            .run_turn_test("what is 2 + 2?", Some(&mut PromptAllowOnce))
             .expect("conversation loop should succeed");
 
         let events = sink.events();
@@ -1047,7 +1086,7 @@ mod tests {
 
         struct SingleCallApiClient;
         impl ApiClient for SingleCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, request: ApiRequest, _context: &mut dyn std::any::Any) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 if request
                     .messages
                     .iter()
@@ -1069,7 +1108,7 @@ mod tests {
             }
         }
 
-        let mut runtime = ConversationRuntime::new(
+        let mut runtime = new_test_runtime(
             Session::new(),
             SingleCallApiClient,
             StaticToolExecutor::new(),
@@ -1078,7 +1117,7 @@ mod tests {
         );
 
         let summary = runtime
-            .run_turn("use the tool", Some(&mut RejectPrompter))
+            .run_turn_test("use the tool", Some(&mut RejectPrompter))
             .expect("conversation should continue after denied tool");
 
         assert_eq!(summary.tool_results.len(), 1);
@@ -1092,7 +1131,7 @@ mod tests {
     fn denies_tool_use_when_pre_tool_hook_blocks() {
         struct SingleCallApiClient;
         impl ApiClient for SingleCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, request: ApiRequest, _context: &mut dyn std::any::Any) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 if request
                     .messages
                     .iter()
@@ -1114,7 +1153,7 @@ mod tests {
             }
         }
 
-        let mut runtime = ConversationRuntime::new_with_features(
+        let mut runtime = new_test_runtime_with_features(
             Session::new(),
             SingleCallApiClient,
             StaticToolExecutor::new().register("blocked", |_input| {
@@ -1130,7 +1169,7 @@ mod tests {
         );
 
         let summary = runtime
-            .run_turn("use the tool", None)
+            .run_turn_test("use the tool", None)
             .expect("conversation should continue after hook denial");
 
         assert_eq!(summary.tool_results.len(), 1);
@@ -1141,7 +1180,7 @@ mod tests {
             panic!("expected tool result block");
         };
         assert!(
-            *is_error,
+            is_error,
             "hook denial should produce an error result: {output}"
         );
         assert!(
@@ -1154,7 +1193,7 @@ mod tests {
     fn denies_tool_use_when_pre_tool_hook_fails() {
         struct SingleCallApiClient;
         impl ApiClient for SingleCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, request: ApiRequest, _context: &mut dyn std::any::Any) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 if request
                     .messages
                     .iter()
@@ -1177,7 +1216,7 @@ mod tests {
         }
 
         // given
-        let mut runtime = ConversationRuntime::new_with_features(
+        let mut runtime = new_test_runtime_with_features(
             Session::new(),
             SingleCallApiClient,
             StaticToolExecutor::new().register("blocked", |_input| {
@@ -1194,7 +1233,7 @@ mod tests {
 
         // when
         let summary = runtime
-            .run_turn("use the tool", None)
+            .run_turn_test("use the tool", None)
             .expect("conversation should continue after hook failure");
 
         // then
@@ -1206,7 +1245,7 @@ mod tests {
             panic!("expected tool result block");
         };
         assert!(
-            *is_error,
+            is_error,
             "hook failure should produce an error result: {output}"
         );
         assert!(
@@ -1222,7 +1261,7 @@ mod tests {
         }
 
         impl ApiClient for TwoCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, request: ApiRequest, _context: &mut dyn std::any::Any) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 self.calls += 1;
                 match self.calls {
                     1 => Ok(vec![
@@ -1248,7 +1287,7 @@ mod tests {
             }
         }
 
-        let mut runtime = ConversationRuntime::new_with_features(
+        let mut runtime = new_test_runtime_with_features(
             Session::new(),
             TwoCallApiClient { calls: 0 },
             StaticToolExecutor::new().register("add", |_input| Ok("4".to_string())),
@@ -1262,7 +1301,7 @@ mod tests {
         );
 
         let summary = runtime
-            .run_turn("use add", None)
+            .run_turn_test("use add", None)
             .expect("tool loop succeeds");
 
         assert_eq!(summary.tool_results.len(), 1);
@@ -1273,7 +1312,7 @@ mod tests {
             panic!("expected tool result block");
         };
         assert!(
-            !*is_error,
+            !is_error,
             "post hook should preserve non-error result: {output:?}"
         );
         assert!(
@@ -1297,7 +1336,7 @@ mod tests {
         }
 
         impl ApiClient for TwoCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, request: ApiRequest, _context: &mut dyn std::any::Any) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 self.calls += 1;
                 match self.calls {
                     1 => Ok(vec![
@@ -1324,7 +1363,7 @@ mod tests {
         }
 
         // given
-        let mut runtime = ConversationRuntime::new_with_features(
+        let mut runtime = new_test_runtime_with_features(
             Session::new(),
             TwoCallApiClient { calls: 0 },
             StaticToolExecutor::new()
@@ -1340,7 +1379,7 @@ mod tests {
 
         // when
         let summary = runtime
-            .run_turn("use fail", None)
+            .run_turn_test("use fail", None)
             .expect("tool loop succeeds");
 
         // then
@@ -1352,7 +1391,7 @@ mod tests {
             panic!("expected tool result block");
         };
         assert!(
-            *is_error,
+            is_error,
             "failure hook path should preserve error result: {output:?}"
         );
         assert!(
@@ -1373,10 +1412,7 @@ mod tests {
     fn reconstructs_usage_tracker_from_restored_session() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, _request: ApiRequest, _context: &mut dyn std::any::Any) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 Ok(vec![
                     AssistantEvent::TextDelta("done".to_string()),
                     AssistantEvent::MessageStop,
@@ -1399,7 +1435,7 @@ mod tests {
                 }),
             ));
 
-        let runtime = ConversationRuntime::new(
+        let runtime = new_test_runtime(
             session,
             SimpleApi,
             StaticToolExecutor::new(),
@@ -1415,10 +1451,7 @@ mod tests {
     fn compacts_session_after_turns() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, _request: ApiRequest, _context: &mut dyn std::any::Any) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 Ok(vec![
                     AssistantEvent::TextDelta("done".to_string()),
                     AssistantEvent::MessageStop,
@@ -1426,16 +1459,16 @@ mod tests {
             }
         }
 
-        let mut runtime = ConversationRuntime::new(
+        let mut runtime = new_test_runtime(
             Session::new(),
             SimpleApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         );
-        runtime.run_turn("a", None).expect("turn a");
-        runtime.run_turn("b", None).expect("turn b");
-        runtime.run_turn("c", None).expect("turn c");
+        runtime.run_turn_test("a", None).expect("turn a");
+        runtime.run_turn_test("b", None).expect("turn b");
+        runtime.run_turn_test("c", None).expect("turn c");
 
         let result = runtime.compact(CompactionConfig {
             preserve_recent_messages: 2,
@@ -1457,10 +1490,7 @@ mod tests {
     fn persists_conversation_turn_messages_to_jsonl_session() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, _request: ApiRequest, _context: &mut dyn std::any::Any) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 Ok(vec![
                     AssistantEvent::TextDelta("done".to_string()),
                     AssistantEvent::MessageStop,
@@ -1470,7 +1500,7 @@ mod tests {
 
         let path = temp_session_path("persisted-turn");
         let session = Session::new().with_persistence_path(path.clone());
-        let mut runtime = ConversationRuntime::new(
+        let mut runtime = new_test_runtime(
             session,
             SimpleApi,
             StaticToolExecutor::new(),
@@ -1479,7 +1509,7 @@ mod tests {
         );
 
         runtime
-            .run_turn("persist this turn", None)
+            .run_turn_test("persist this turn", None)
             .expect("turn should succeed");
 
         let restored = Session::load_from_path(&path).expect("persisted session should reload");
@@ -1498,7 +1528,7 @@ mod tests {
             .push_user_text("branch me")
             .expect("message should append");
 
-        let runtime = ConversationRuntime::new(
+        let runtime = new_test_runtime(
             session.clone(),
             ScriptedApiClient { call_count: 0 },
             StaticToolExecutor::new(),
@@ -1542,10 +1572,7 @@ mod tests {
     fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, _request: ApiRequest, _context: &mut dyn std::any::Any) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 Ok(vec![
                     AssistantEvent::TextDelta("done".to_string()),
                     AssistantEvent::Usage(TokenUsage {
@@ -1571,7 +1598,7 @@ mod tests {
             }]),
         ];
 
-        let mut runtime = ConversationRuntime::new(
+        let mut runtime = new_test_runtime(
             session,
             SimpleApi,
             StaticToolExecutor::new(),
@@ -1581,7 +1608,7 @@ mod tests {
         .with_auto_compaction_input_tokens_threshold(100_000);
 
         let summary = runtime
-            .run_turn("trigger", None)
+            .run_turn_test("trigger", None)
             .expect("turn should succeed");
 
         assert_eq!(
@@ -1597,10 +1624,7 @@ mod tests {
     fn skips_auto_compaction_below_threshold() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, _request: ApiRequest, _context: &mut dyn std::any::Any) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 Ok(vec![
                     AssistantEvent::TextDelta("done".to_string()),
                     AssistantEvent::Usage(TokenUsage {
@@ -1614,7 +1638,7 @@ mod tests {
             }
         }
 
-        let mut runtime = ConversationRuntime::new(
+        let mut runtime = new_test_runtime(
             Session::new(),
             SimpleApi,
             StaticToolExecutor::new(),
@@ -1624,7 +1648,7 @@ mod tests {
         .with_auto_compaction_input_tokens_threshold(100_000);
 
         let summary = runtime
-            .run_turn("trigger", None)
+            .run_turn_test("trigger", None)
             .expect("turn should succeed");
         assert_eq!(summary.auto_compaction, None);
         assert_eq!(runtime.session().messages.len(), 2);
@@ -1651,10 +1675,7 @@ mod tests {
     fn compaction_health_probe_blocks_turn_when_tool_executor_is_broken() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, _request: ApiRequest, _context: &mut dyn std::any::Any) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 panic!("API should not run when health probe fails");
             }
         }
@@ -1668,7 +1689,7 @@ mod tests {
         let tool_executor = StaticToolExecutor::new().register("glob_search", |_input| {
             Err(ToolError::new("transport unavailable"))
         });
-        let mut runtime = ConversationRuntime::new(
+        let mut runtime = new_test_runtime(
             session,
             SimpleApi,
             tool_executor,
@@ -1677,7 +1698,7 @@ mod tests {
         );
 
         let error = runtime
-            .run_turn("trigger", None)
+            .run_turn_test("trigger", None)
             .expect_err("health probe failure should abort the turn");
         assert!(
             error
@@ -1695,10 +1716,7 @@ mod tests {
     fn compaction_health_probe_skips_empty_compacted_session() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, _request: ApiRequest, _context: &mut dyn std::any::Any) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 Ok(vec![
                     AssistantEvent::TextDelta("done".to_string()),
                     AssistantEvent::MessageStop,
@@ -1714,7 +1732,7 @@ mod tests {
                 "glob_search should not run for an empty compacted session",
             ))
         });
-        let mut runtime = ConversationRuntime::new(
+        let mut runtime = new_test_runtime(
             session,
             SimpleApi,
             tool_executor,
@@ -1723,7 +1741,7 @@ mod tests {
         );
 
         let summary = runtime
-            .run_turn("trigger", None)
+            .run_turn_test("trigger", None)
             .expect("empty compacted session should not fail health probe");
         assert_eq!(summary.auto_compaction, None);
         assert_eq!(runtime.session().messages.len(), 2);
@@ -1819,10 +1837,7 @@ mod tests {
         struct LoopingApi;
 
         impl ApiClient for LoopingApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, _request: ApiRequest, _context: &mut dyn std::any::Any) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 Ok(vec![
                     AssistantEvent::ToolUse {
                         id: "tool-1".to_string(),
@@ -1835,7 +1850,7 @@ mod tests {
         }
 
         // given
-        let mut runtime = ConversationRuntime::new(
+        let mut runtime = new_test_runtime(
             Session::new(),
             LoopingApi,
             StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
@@ -1846,7 +1861,7 @@ mod tests {
 
         // when
         let error = runtime
-            .run_turn("loop", None)
+            .run_turn_test("loop", None)
             .expect_err("conversation loop should stop after the configured limit");
 
         // then
@@ -1860,16 +1875,13 @@ mod tests {
         struct FailingApi;
 
         impl ApiClient for FailingApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, _request: ApiRequest, _context: &mut dyn std::any::Any) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 Err(RuntimeError::new("upstream failed"))
             }
         }
 
         // given
-        let mut runtime = ConversationRuntime::new(
+        let mut runtime = new_test_runtime(
             Session::new(),
             FailingApi,
             StaticToolExecutor::new(),
@@ -1879,7 +1891,7 @@ mod tests {
 
         // when
         let error = runtime
-            .run_turn("hello", None)
+            .run_turn_test("hello", None)
             .expect_err("API failures should propagate");
 
         // then

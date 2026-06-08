@@ -14063,6 +14063,9 @@ fn permission_policy(
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
     let mut converted: Vec<InputMessage> = Vec::new();
     for message in messages {
+        if message.role == MessageRole::System {
+            continue;
+        }
         let role = match message.role {
             MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
             MessageRole::Assistant => "assistant",
@@ -17424,6 +17427,7 @@ mod tests {
                 true,
                 None,
                 PermissionMode::DangerFullAccess,
+                None,
             )
             .expect("cli should initialize")
             .startup_banner()
@@ -19059,6 +19063,7 @@ UU conflicted.rs",
             &mut pending_tool,
             false,
             &mut block_has_thinking_summary,
+            &TerminalRenderer::new(),
         )
         .expect("text block should render");
 
@@ -19085,6 +19090,7 @@ UU conflicted.rs",
             &mut pending_tool,
             true,
             &mut block_has_thinking_summary,
+            &TerminalRenderer::new(),
         )
         .expect("tool block should accumulate");
 
@@ -19120,6 +19126,7 @@ UU conflicted.rs",
                 request_id: None,
             },
             &mut out,
+            &TerminalRenderer::new(),
         )
         .expect("response conversion should succeed");
 
@@ -19155,6 +19162,7 @@ UU conflicted.rs",
                 request_id: None,
             },
             &mut out,
+            &TerminalRenderer::new(),
         )
         .expect("response conversion should succeed");
 
@@ -19194,6 +19202,7 @@ UU conflicted.rs",
                 request_id: None,
             },
             &mut out,
+            &TerminalRenderer::new(),
         )
         .expect("response conversion should succeed");
 
@@ -19450,6 +19459,7 @@ UU conflicted.rs",
             PermissionMode::DangerFullAccess,
             None,
             runtime_plugin_state,
+            None,
         )
         .expect("runtime should build");
 

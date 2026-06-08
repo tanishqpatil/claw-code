@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -30,6 +31,7 @@ fn now_secs() -> u64 {
 pub enum WorkerStatus {
     Spawning,
     TrustRequired,
+    ToolPermissionRequired,
     ReadyForPrompt,
     Running,
     Finished,
@@ -41,6 +43,7 @@ impl std::fmt::Display for WorkerStatus {
         match self {
             Self::Spawning => write!(f, "spawning"),
             Self::TrustRequired => write!(f, "trust_required"),
+            Self::ToolPermissionRequired => write!(f, "tool_permission_required"),
             Self::ReadyForPrompt => write!(f, "ready_for_prompt"),
             Self::Running => write!(f, "running"),
             Self::Finished => write!(f, "finished"),
@@ -53,6 +56,7 @@ impl std::fmt::Display for WorkerStatus {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerFailureKind {
     TrustGate,
+    ToolPermissionGate,
     PromptDelivery,
     Protocol,
     Provider,
@@ -70,7 +74,9 @@ pub struct WorkerFailure {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerEventKind {
     Spawning,
+    StartupPreflightWarning,
     TrustRequired,
+    ToolPermissionRequired,
     TrustResolved,
     ReadyForPrompt,
     PromptMisdelivery,
@@ -98,12 +104,29 @@ pub enum WorkerPromptTarget {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerStartupPreflightWarningKind {
+    FileAbsentOnBranch,
+    GitMetadataNotWritable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerStartupPreflightWarning {
+    pub kind: WorkerStartupPreflightWarningKind,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
 /// Classification of startup failure when no evidence is available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupFailureClassification {
     /// Trust prompt is required but not detected/resolved
     TrustRequired,
+    /// Tool permission prompt is required before startup can continue
+    ToolPermissionRequired,
     /// Prompt was delivered to wrong target (shell misdelivery)
     PromptMisdelivery,
     /// Prompt was sent but acceptance timed out
@@ -116,13 +139,37 @@ pub enum StartupFailureClassification {
     Unknown,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartupHealthSummary {
+    /// Whether this subsystem appeared healthy at timeout.
+    pub healthy: bool,
+    /// Stable placeholder/source string until deeper transport and MCP probes are wired in.
+    pub summary: String,
+}
+
+impl StartupHealthSummary {
+    fn observed(name: &str, healthy: bool) -> Self {
+        let status = if healthy { "healthy" } else { "unhealthy" };
+        Self {
+            healthy,
+            summary: format!("{name}_{status}_placeholder"),
+        }
+    }
+}
+
 /// Evidence bundle collected when worker startup times out without clear evidence.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StartupEvidenceBundle {
     /// Last known worker lifecycle state before timeout
     pub last_lifecycle_state: WorkerStatus,
+    /// Timestamp of the last lifecycle state transition, unix epoch seconds
+    pub last_lifecycle_at: u64,
     /// The pane/command that was being executed
     pub pane_command: String,
+    /// Timestamp when the pane/command snapshot was observed, unix epoch seconds
+    pub pane_observed_at: u64,
+    /// Timestamp when the worker command was started, unix epoch seconds
+    pub command_started_at: u64,
     /// Timestamp when prompt was sent (if any), unix epoch seconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_sent_at: Option<u64>,
@@ -130,10 +177,22 @@ pub struct StartupEvidenceBundle {
     pub prompt_acceptance_state: bool,
     /// Result of trust prompt detection at timeout
     pub trust_prompt_detected: bool,
+    /// Result of tool permission prompt detection at timeout
+    pub tool_permission_prompt_detected: bool,
+    /// Age in seconds of the latest tool permission prompt, when observed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_permission_prompt_age_seconds: Option<u64>,
+    /// Whether the prompt surface exposed only a session allow path or also an always-allow path
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_permission_allow_scope: Option<ToolPermissionAllowScope>,
     /// Transport health summary (true = healthy/responsive)
     pub transport_healthy: bool,
+    /// Typed transport health placeholder for future concrete probes
+    pub transport_health: StartupHealthSummary,
     /// MCP health summary (true = all servers healthy)
     pub mcp_healthy: bool,
+    /// Typed MCP health placeholder for future concrete probes
+    pub mcp_health: StartupHealthSummary,
     /// Seconds since worker creation
     pub elapsed_seconds: u64,
 }
@@ -145,6 +204,15 @@ pub enum WorkerEventPayload {
         cwd: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         resolution: Option<WorkerTrustResolution>,
+    },
+    ToolPermissionPrompt {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        prompt_age_seconds: u64,
+        allow_scope: ToolPermissionAllowScope,
+        prompt_preview: String,
     },
     PromptDelivery {
         prompt_preview: String,
@@ -161,6 +229,20 @@ pub enum WorkerEventPayload {
         evidence: StartupEvidenceBundle,
         classification: StartupFailureClassification,
     },
+    StartupPreflightWarning {
+        kind: WorkerStartupPreflightWarningKind,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPermissionAllowScope {
+    SessionOnly,
+    SessionOrAlways,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -194,6 +276,7 @@ pub struct Worker {
     pub auto_recover_prompt_misdelivery: bool,
     pub prompt_delivery_attempts: u32,
     pub prompt_in_flight: bool,
+    pub prompt_sent_at: Option<u64>,
     pub last_prompt: Option<String>,
     pub expected_receipt: Option<WorkerTaskReceipt>,
     pub replay_prompt: Option<String>,
@@ -243,6 +326,7 @@ impl WorkerRegistry {
             auto_recover_prompt_misdelivery,
             prompt_delivery_attempts: 0,
             prompt_in_flight: false,
+            prompt_sent_at: None,
             last_prompt: None,
             expected_receipt: None,
             replay_prompt: None,
@@ -268,6 +352,34 @@ impl WorkerRegistry {
         inner.workers.get(worker_id).cloned()
     }
 
+    pub fn observe_startup_preflight(
+        &self,
+        worker_id: &str,
+        task_prompt: &str,
+    ) -> Result<Worker, String> {
+        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let worker = inner
+            .workers
+            .get_mut(worker_id)
+            .ok_or_else(|| format!("worker not found: {worker_id}"))?;
+
+        for warning in startup_preflight_warnings(Path::new(&worker.cwd), task_prompt) {
+            push_event(
+                worker,
+                WorkerEventKind::StartupPreflightWarning,
+                worker.status,
+                Some(warning.message.clone()),
+                Some(WorkerEventPayload::StartupPreflightWarning {
+                    kind: warning.kind,
+                    message: warning.message,
+                    path: warning.path,
+                }),
+            );
+        }
+
+        Ok(worker.clone())
+    }
+
     pub fn observe(&self, worker_id: &str, screen_text: &str) -> Result<Worker, String> {
         let mut inner = self.inner.lock().expect("worker registry lock poisoned");
         let worker = inner
@@ -275,6 +387,29 @@ impl WorkerRegistry {
             .get_mut(worker_id)
             .ok_or_else(|| format!("worker not found: {worker_id}"))?;
         let lowered = screen_text.to_ascii_lowercase();
+
+        if let Some(tool_prompt) = detect_tool_permission_prompt(screen_text, &lowered) {
+            worker.status = WorkerStatus::ToolPermissionRequired;
+            worker.last_error = Some(WorkerFailure {
+                kind: WorkerFailureKind::ToolPermissionGate,
+                message: tool_prompt.message(),
+                created_at: now_secs(),
+            });
+            push_event(
+                worker,
+                WorkerEventKind::ToolPermissionRequired,
+                WorkerStatus::ToolPermissionRequired,
+                Some("tool permission prompt detected".to_string()),
+                Some(WorkerEventPayload::ToolPermissionPrompt {
+                    server_name: tool_prompt.server_name,
+                    tool_name: tool_prompt.tool_name,
+                    prompt_age_seconds: 0,
+                    allow_scope: tool_prompt.allow_scope,
+                    prompt_preview: tool_prompt.prompt_preview,
+                }),
+            );
+            return Ok(worker.clone());
+        }
 
         if !worker.trust_gate_cleared && detect_trust_prompt(&lowered) {
             worker.status = WorkerStatus::TrustRequired;
@@ -474,6 +609,7 @@ impl WorkerRegistry {
 
         worker.prompt_delivery_attempts += 1;
         worker.prompt_in_flight = true;
+        worker.prompt_sent_at = Some(now_secs());
         worker.last_prompt = Some(next_prompt.clone());
         worker.expected_receipt = task_receipt;
         worker.replay_prompt = None;
@@ -503,7 +639,9 @@ impl WorkerRegistry {
             ready: worker.status == WorkerStatus::ReadyForPrompt,
             blocked: matches!(
                 worker.status,
-                WorkerStatus::TrustRequired | WorkerStatus::Failed
+                WorkerStatus::TrustRequired
+                    | WorkerStatus::ToolPermissionRequired
+                    | WorkerStatus::Failed
             ),
             replay_prompt_ready: worker.replay_prompt.is_some(),
             last_error: worker.last_error.clone(),
@@ -523,6 +661,7 @@ impl WorkerRegistry {
         worker.last_error = None;
         worker.prompt_delivery_attempts = 0;
         worker.prompt_in_flight = false;
+        worker.prompt_sent_at = None;
         push_event(
             worker,
             WorkerEventKind::Restarted,
@@ -624,24 +763,44 @@ impl WorkerRegistry {
 
         let now = now_secs();
         let elapsed = now.saturating_sub(worker.created_at);
+        let latest_tool_permission_event = worker
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == WorkerEventKind::ToolPermissionRequired);
+        let tool_permission_allow_scope =
+            latest_tool_permission_event.and_then(|event| match &event.payload {
+                Some(WorkerEventPayload::ToolPermissionPrompt { allow_scope, .. }) => {
+                    Some(*allow_scope)
+                }
+                _ => None,
+            });
 
         // Build evidence bundle
         let evidence = StartupEvidenceBundle {
             last_lifecycle_state: worker.status,
+            last_lifecycle_at: worker.updated_at,
             pane_command: pane_command.to_string(),
-            prompt_sent_at: if worker.prompt_delivery_attempts > 0 {
-                Some(worker.updated_at)
-            } else {
-                None
-            },
+            pane_observed_at: now,
+            command_started_at: worker.created_at,
+            prompt_sent_at: worker.prompt_sent_at,
             prompt_acceptance_state: worker.status == WorkerStatus::Running
                 && !worker.prompt_in_flight,
             trust_prompt_detected: worker
                 .events
                 .iter()
                 .any(|e| e.kind == WorkerEventKind::TrustRequired),
+            tool_permission_prompt_detected: worker
+                .events
+                .iter()
+                .any(|e| e.kind == WorkerEventKind::ToolPermissionRequired),
+            tool_permission_prompt_age_seconds: latest_tool_permission_event
+                .map(|event| now.saturating_sub(event.timestamp)),
+            tool_permission_allow_scope,
             transport_healthy,
+            transport_health: StartupHealthSummary::observed("transport", transport_healthy),
             mcp_healthy,
+            mcp_health: StartupHealthSummary::observed("mcp", mcp_healthy),
             elapsed_seconds: elapsed,
         };
 
@@ -692,6 +851,13 @@ fn classify_startup_failure(evidence: &StartupEvidenceBundle) -> StartupFailureC
         && evidence.last_lifecycle_state == WorkerStatus::TrustRequired
     {
         return StartupFailureClassification::TrustRequired;
+    }
+
+    // Check for tool permission prompts that were not resolved
+    if evidence.tool_permission_prompt_detected
+        && evidence.last_lifecycle_state == WorkerStatus::ToolPermissionRequired
+    {
+        return StartupFailureClassification::ToolPermissionRequired;
     }
 
     // Check for prompt acceptance timeout
@@ -813,6 +979,262 @@ fn path_matches_allowlist(cwd: &str, trusted_root: &str) -> bool {
 
 fn normalize_path(path: &str) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| Path::new(path).to_path_buf())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolPermissionPromptObservation {
+    server_name: Option<String>,
+    tool_name: Option<String>,
+    allow_scope: ToolPermissionAllowScope,
+    prompt_preview: String,
+}
+
+impl ToolPermissionPromptObservation {
+    fn message(&self) -> String {
+        match (&self.server_name, &self.tool_name) {
+            (Some(server), Some(tool)) => {
+                format!("worker boot blocked on tool permission prompt for {server}.{tool}")
+            }
+            (Some(server), None) => {
+                format!("worker boot blocked on tool permission prompt for {server}")
+            }
+            (None, Some(tool)) => {
+                format!("worker boot blocked on tool permission prompt for {tool}")
+            }
+            (None, None) => "worker boot blocked on tool permission prompt".to_string(),
+        }
+    }
+}
+
+fn detect_tool_permission_prompt(
+    screen_text: &str,
+    lowered: &str,
+) -> Option<ToolPermissionPromptObservation> {
+    let looks_like_prompt = lowered.contains("allow the")
+        && lowered.contains("server")
+        && lowered.contains("tool")
+        && lowered.contains("run");
+    let looks_like_tool_gate = lowered.contains("allow tool") && lowered.contains("run");
+    if !looks_like_prompt && !looks_like_tool_gate {
+        return None;
+    }
+
+    let prompt_line = screen_text
+        .lines()
+        .rev()
+        .find(|line| {
+            let lowered_line = line.to_ascii_lowercase();
+            lowered_line.contains("allow")
+                && lowered_line.contains("tool")
+                && (lowered_line.contains("run") || lowered_line.contains("server"))
+        })
+        .unwrap_or(screen_text)
+        .trim();
+
+    let tool_name = extract_quoted_value(prompt_line)
+        .or_else(|| extract_after(prompt_line, "tool ").map(|token| normalize_tool_token(&token)));
+    let server_name = extract_between(prompt_line, "the ", " server")
+        .map(|server| server.trim_end_matches(" MCP").to_string())
+        .or_else(|| {
+            tool_name
+                .as_deref()
+                .and_then(extract_server_from_qualified_tool)
+        });
+
+    Some(ToolPermissionPromptObservation {
+        server_name,
+        tool_name,
+        allow_scope: detect_tool_permission_allow_scope(lowered),
+        prompt_preview: prompt_preview(prompt_line),
+    })
+}
+
+fn detect_tool_permission_allow_scope(lowered: &str) -> ToolPermissionAllowScope {
+    let always_allow_capable = [
+        "always allow",
+        "allow always",
+        "allow this tool always",
+        "allow for all sessions",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle));
+
+    if always_allow_capable {
+        return ToolPermissionAllowScope::SessionOrAlways;
+    }
+
+    let session_allow_capable = [
+        "allow once",
+        "allow for this session",
+        "allow this session",
+        "yes, allow",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle));
+
+    if session_allow_capable {
+        ToolPermissionAllowScope::SessionOnly
+    } else {
+        ToolPermissionAllowScope::Unknown
+    }
+}
+
+fn extract_quoted_value(text: &str) -> Option<String> {
+    let start = text.find('"')? + 1;
+    let rest = &text[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn extract_between(text: &str, prefix: &str, suffix: &str) -> Option<String> {
+    let start = text.find(prefix)? + prefix.len();
+    let rest = &text[start..];
+    let end = rest.find(suffix)?;
+    let value = rest[..end].trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn extract_after(text: &str, prefix: &str) -> Option<String> {
+    let start = text.to_ascii_lowercase().find(prefix)? + prefix.len();
+    let value = text[start..]
+        .split_whitespace()
+        .next()?
+        .trim_matches(|ch: char| ch == '?' || ch == ':' || ch == '"' || ch == '\'');
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn normalize_tool_token(token: &str) -> String {
+    token
+        .trim_matches(|ch: char| ch == '?' || ch == ':' || ch == '"' || ch == '\'')
+        .to_string()
+}
+
+fn extract_server_from_qualified_tool(tool: &str) -> Option<String> {
+    let rest = tool.strip_prefix("mcp__")?;
+    let (server, _) = rest.split_once("__")?;
+    (!server.is_empty()).then(|| server.to_string())
+}
+
+pub fn startup_preflight_warnings(
+    cwd: &Path,
+    task_prompt: &str,
+) -> Vec<WorkerStartupPreflightWarning> {
+    let mut warnings = Vec::new();
+
+    if let Some(git_path) = git_metadata_path(cwd) {
+        if !path_is_writable(&git_path) {
+            warnings.push(WorkerStartupPreflightWarning {
+                kind: WorkerStartupPreflightWarningKind::GitMetadataNotWritable,
+                message: format!(
+                    "git metadata is not writable; commits or pushes may fail: {}",
+                    git_path.display()
+                ),
+                path: Some(git_path.display().to_string()),
+            });
+        }
+    }
+
+    for path in mentioned_repo_paths(task_prompt) {
+        if !git_tracks_path(cwd, &path) {
+            warnings.push(WorkerStartupPreflightWarning {
+                kind: WorkerStartupPreflightWarningKind::FileAbsentOnBranch,
+                message: format!(
+                    "task mentions {path}, but git does not track it on the current branch"
+                ),
+                path: Some(path),
+            });
+        }
+    }
+
+    warnings
+}
+
+fn mentioned_repo_paths(task_prompt: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in task_prompt.split_whitespace() {
+        let token = raw.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+            )
+        });
+        if !token.contains('/') || token.contains("://") || token.starts_with('/') {
+            continue;
+        }
+        let token = token.trim_start_matches("./");
+        if token.contains("..") {
+            continue;
+        }
+        if token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '-' | '.'))
+            && token
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name.contains('.'))
+            && !out.iter().any(|seen| seen == token)
+        {
+            out.push(token.to_string());
+        }
+    }
+    out
+}
+
+fn git_tracks_path(cwd: &Path, path: &str) -> bool {
+    Command::new("git")
+        .arg("ls-files")
+        .arg("--error-unmatch")
+        .arg("--")
+        .arg(path)
+        .current_dir(cwd)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn git_metadata_path(cwd: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(text);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    })
+}
+
+fn path_is_writable(path: &Path) -> bool {
+    let probe_dir = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    std::fs::metadata(probe_dir)
+        .ok()
+        .filter(std::fs::Metadata::is_dir)
+        .is_some_and(|metadata| metadata_allows_directory_writes(&metadata))
+}
+
+#[cfg(unix)]
+fn metadata_allows_directory_writes(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = metadata.permissions().mode();
+    mode & 0o222 != 0 && mode & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn metadata_allows_directory_writes(metadata: &std::fs::Metadata) -> bool {
+    !metadata.permissions().readonly()
 }
 
 fn detect_trust_prompt(lowered: &str) -> bool {
@@ -1036,6 +1458,8 @@ fn cwd_matches_observed_target(expected_cwd: &str, observed_cwd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::process::Command;
 
     #[test]
     fn allowlisted_trust_prompt_auto_resolves_then_reaches_ready_state() {
@@ -1132,6 +1556,203 @@ mod tests {
         assert!(!detect_ready_for_prompt("bellman@host %", "bellman@host %"));
         assert!(!detect_ready_for_prompt("/tmp/repo $", "/tmp/repo $"));
         assert!(detect_ready_for_prompt("│ >", "│ >"));
+    }
+
+    #[test]
+    fn tool_permission_prompt_blocks_worker_with_structured_event() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-mcp", &[], true);
+
+        let blocked = registry
+            .observe(
+                &worker.worker_id,
+                "Allow the omx_memory MCP server to run tool \"project_memory_read\"?\n\
+                 1. Yes, allow once\n\
+                 2. Always allow this tool",
+            )
+            .expect("tool permission observe should succeed");
+
+        assert_eq!(blocked.status, WorkerStatus::ToolPermissionRequired);
+        assert_eq!(
+            blocked
+                .last_error
+                .as_ref()
+                .expect("tool permission error should exist")
+                .kind,
+            WorkerFailureKind::ToolPermissionGate
+        );
+        let event = blocked
+            .events
+            .iter()
+            .find(|event| event.kind == WorkerEventKind::ToolPermissionRequired)
+            .expect("tool permission event should exist");
+        assert_eq!(
+            event.payload,
+            Some(WorkerEventPayload::ToolPermissionPrompt {
+                server_name: Some("omx_memory".to_string()),
+                tool_name: Some("project_memory_read".to_string()),
+                prompt_age_seconds: 0,
+                allow_scope: ToolPermissionAllowScope::SessionOrAlways,
+                prompt_preview: prompt_preview(
+                    "Allow the omx_memory MCP server to run tool \"project_memory_read\"?",
+                ),
+            })
+        );
+
+        let readiness = registry
+            .await_ready(&worker.worker_id)
+            .expect("ready snapshot should load");
+        assert!(readiness.blocked);
+        assert!(!readiness.ready);
+    }
+
+    #[test]
+    fn startup_preflight_warns_when_task_file_is_absent_on_branch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        Command::new("git")
+            .arg("init")
+            .current_dir(tmp.path())
+            .output()
+            .expect("git init should run");
+        fs::create_dir_all(tmp.path().join("src")).expect("src dir");
+        fs::write(tmp.path().join("src/lib.rs"), "pub fn present() {}\n").expect("write file");
+        Command::new("git")
+            .args(["add", "src/lib.rs"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git add should run");
+
+        let warnings = startup_preflight_warnings(
+            tmp.path(),
+            "Fix src/lib.rs and rust/crates/runtime/src/trident.rs before testing.",
+        );
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == WorkerStartupPreflightWarningKind::FileAbsentOnBranch
+                && warning.path.as_deref() == Some("rust/crates/runtime/src/trident.rs")
+        }));
+        assert!(!warnings.iter().any(|warning| {
+            warning.kind == WorkerStartupPreflightWarningKind::FileAbsentOnBranch
+                && warning.path.as_deref() == Some("src/lib.rs")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_preflight_warns_when_git_metadata_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree = tmp.path().join("worktree");
+        fs::create_dir_all(&worktree).expect("worktree dir");
+        Command::new("git")
+            .arg("init")
+            .current_dir(&worktree)
+            .output()
+            .expect("git init should run");
+        let git_dir = worktree.join(".git");
+
+        let original_permissions = fs::metadata(&git_dir)
+            .expect("gitdir metadata")
+            .permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_mode(0o555);
+        fs::set_permissions(&git_dir, read_only_permissions).expect("make gitdir read-only");
+
+        let warnings = startup_preflight_warnings(&worktree, "Audit repository.");
+        let registry = WorkerRegistry::new();
+        let worker = registry.create(&worktree.display().to_string(), &[], true);
+        let observed = registry
+            .observe_startup_preflight(&worker.worker_id, "Audit repository.")
+            .expect("preflight should run");
+
+        fs::set_permissions(&git_dir, original_permissions).expect("restore gitdir permissions");
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == WorkerStartupPreflightWarningKind::GitMetadataNotWritable
+                && warning.path.as_deref() == Some(git_dir.to_string_lossy().as_ref())
+        }));
+        assert!(observed.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                Some(WorkerEventPayload::StartupPreflightWarning {
+                    kind: WorkerStartupPreflightWarningKind::GitMetadataNotWritable,
+                    path: Some(path),
+                    ..
+                }) if path == git_dir.to_string_lossy().as_ref()
+            )
+        }));
+    }
+
+    #[test]
+    fn startup_preflight_records_structured_warning_event() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        Command::new("git")
+            .arg("init")
+            .current_dir(tmp.path())
+            .output()
+            .expect("git init should run");
+        let registry = WorkerRegistry::new();
+        let worker = registry.create(&tmp.path().display().to_string(), &[], true);
+
+        let observed = registry
+            .observe_startup_preflight(&worker.worker_id, "Open missing/file.rs")
+            .expect("preflight should run");
+
+        let event = observed
+            .events
+            .iter()
+            .find(|event| event.kind == WorkerEventKind::StartupPreflightWarning)
+            .expect("preflight warning event");
+        assert!(matches!(
+            event.payload,
+            Some(WorkerEventPayload::StartupPreflightWarning {
+                kind: WorkerStartupPreflightWarningKind::FileAbsentOnBranch,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn startup_timeout_classifies_tool_permission_prompt() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-mcp-timeout", &[], true);
+
+        registry
+            .observe(
+                &worker.worker_id,
+                "Allow the omx_memory MCP server to run tool \"notepad_read\"?\n\
+                 1. Yes, allow once",
+            )
+            .expect("tool permission observe should succeed");
+
+        let timed_out = registry
+            .observe_startup_timeout(&worker.worker_id, "claw prompt", true, true)
+            .expect("startup timeout observe should succeed");
+        let event = timed_out
+            .events
+            .iter()
+            .find(|event| event.kind == WorkerEventKind::StartupNoEvidence)
+            .expect("startup no evidence event should exist");
+
+        match event.payload.as_ref() {
+            Some(WorkerEventPayload::StartupNoEvidence {
+                classification,
+                evidence,
+            }) => {
+                assert_eq!(
+                    *classification,
+                    StartupFailureClassification::ToolPermissionRequired
+                );
+                assert!(evidence.tool_permission_prompt_detected);
+                assert_eq!(
+                    evidence.tool_permission_allow_scope,
+                    Some(ToolPermissionAllowScope::SessionOnly)
+                );
+                assert!(evidence.tool_permission_prompt_age_seconds.is_some());
+            }
+            _ => panic!("expected StartupNoEvidence payload"),
+        }
     }
 
     #[test]
@@ -1534,8 +2155,16 @@ mod tests {
                     "last state should be spawning"
                 );
                 assert_eq!(evidence.pane_command, "cargo test");
+                assert!(evidence.command_started_at <= evidence.pane_observed_at);
+                assert!(evidence.last_lifecycle_at <= evidence.pane_observed_at);
                 assert!(!evidence.transport_healthy);
+                assert!(!evidence.transport_health.healthy);
+                assert!(evidence
+                    .transport_health
+                    .summary
+                    .contains("transport_unhealthy"));
                 assert!(evidence.mcp_healthy);
+                assert!(evidence.mcp_health.healthy);
                 assert_eq!(*classification, StartupFailureClassification::TransportDead);
             }
             _ => panic!(
@@ -1627,15 +2256,62 @@ mod tests {
     }
 
     #[test]
+    fn startup_timeout_preserves_original_prompt_sent_timestamp() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-prompt-timestamp", &[], true);
+
+        registry
+            .observe(&worker.worker_id, "Ready for input\n>")
+            .expect("ready observe should succeed");
+        let prompted = registry
+            .send_prompt(
+                &worker.worker_id,
+                Some("Run timestamp-sensitive work"),
+                None,
+            )
+            .expect("prompt send should succeed");
+        let sent_at = prompted
+            .prompt_sent_at
+            .expect("prompt send should record a prompt timestamp");
+
+        let timed_out = registry
+            .observe_startup_timeout(&worker.worker_id, "claw worker", true, true)
+            .expect("startup timeout observe should succeed");
+
+        let event = timed_out
+            .events
+            .iter()
+            .find(|e| e.kind == WorkerEventKind::StartupNoEvidence)
+            .expect("startup no evidence event should exist");
+
+        match event.payload.as_ref() {
+            Some(WorkerEventPayload::StartupNoEvidence { evidence, .. }) => {
+                assert_eq!(evidence.prompt_sent_at, Some(sent_at));
+                assert!(evidence.last_lifecycle_at <= evidence.pane_observed_at);
+                assert!(evidence.command_started_at <= sent_at);
+            }
+            _ => panic!("expected StartupNoEvidence payload"),
+        }
+    }
+
+    #[test]
     fn startup_evidence_bundle_serializes_correctly() {
         let bundle = StartupEvidenceBundle {
             last_lifecycle_state: WorkerStatus::Running,
+            last_lifecycle_at: 1_234_567_889,
             pane_command: "test command".to_string(),
+            pane_observed_at: 1_234_567_891,
+            command_started_at: 1_234_567_800,
             prompt_sent_at: Some(1_234_567_890),
             prompt_acceptance_state: false,
             trust_prompt_detected: true,
+            tool_permission_prompt_detected: false,
+            tool_permission_prompt_age_seconds: None,
+            tool_permission_allow_scope: None,
             transport_healthy: true,
+            transport_health: StartupHealthSummary::observed("transport", true),
             mcp_healthy: false,
+            mcp_health: StartupHealthSummary::observed("mcp", false),
             elapsed_seconds: 60,
         };
 
@@ -1644,8 +2320,13 @@ mod tests {
         assert!(json.contains("\"pane_command\""));
         assert!(json.contains("\"prompt_sent_at\":1234567890"));
         assert!(json.contains("\"trust_prompt_detected\":true"));
+        assert!(json.contains("\"last_lifecycle_at\":1234567889"));
+        assert!(json.contains("\"pane_observed_at\":1234567891"));
+        assert!(json.contains("\"command_started_at\":1234567800"));
         assert!(json.contains("\"transport_healthy\":true"));
+        assert!(json.contains("\"transport_health\""));
         assert!(json.contains("\"mcp_healthy\":false"));
+        assert!(json.contains("\"mcp_health\""));
 
         let deserialized: StartupEvidenceBundle =
             serde_json::from_str(&json).expect("should deserialize");
@@ -1657,12 +2338,20 @@ mod tests {
     fn classify_startup_failure_detects_transport_dead() {
         let evidence = StartupEvidenceBundle {
             last_lifecycle_state: WorkerStatus::Spawning,
+            last_lifecycle_at: 10,
             pane_command: "test".to_string(),
+            pane_observed_at: 40,
+            command_started_at: 1,
             prompt_sent_at: None,
             prompt_acceptance_state: false,
             trust_prompt_detected: false,
+            tool_permission_prompt_detected: false,
+            tool_permission_prompt_age_seconds: None,
+            tool_permission_allow_scope: None,
             transport_healthy: false,
+            transport_health: StartupHealthSummary::observed("transport", false),
             mcp_healthy: true,
+            mcp_health: StartupHealthSummary::observed("mcp", true),
             elapsed_seconds: 30,
         };
 
@@ -1674,12 +2363,20 @@ mod tests {
     fn classify_startup_failure_defaults_to_unknown() {
         let evidence = StartupEvidenceBundle {
             last_lifecycle_state: WorkerStatus::Spawning,
+            last_lifecycle_at: 10,
             pane_command: "test".to_string(),
+            pane_observed_at: 40,
+            command_started_at: 1,
             prompt_sent_at: None,
             prompt_acceptance_state: false,
             trust_prompt_detected: false,
+            tool_permission_prompt_detected: false,
+            tool_permission_prompt_age_seconds: None,
+            tool_permission_allow_scope: None,
             transport_healthy: true,
+            transport_health: StartupHealthSummary::observed("transport", true),
             mcp_healthy: true,
+            mcp_health: StartupHealthSummary::observed("mcp", true),
             elapsed_seconds: 10,
         };
 
@@ -1688,17 +2385,53 @@ mod tests {
     }
 
     #[test]
+    fn classify_startup_failure_detects_prompt_misdelivery_after_timeout() {
+        let evidence = StartupEvidenceBundle {
+            last_lifecycle_state: WorkerStatus::ReadyForPrompt,
+            last_lifecycle_at: 10,
+            pane_command: "test".to_string(),
+            pane_observed_at: 45,
+            command_started_at: 1,
+            prompt_sent_at: Some(10),
+            prompt_acceptance_state: false,
+            trust_prompt_detected: false,
+            tool_permission_prompt_detected: false,
+            tool_permission_prompt_age_seconds: None,
+            tool_permission_allow_scope: None,
+            transport_healthy: true,
+            transport_health: StartupHealthSummary::observed("transport", true),
+            mcp_healthy: true,
+            mcp_health: StartupHealthSummary::observed("mcp", true),
+            elapsed_seconds: 31,
+        };
+
+        let classification = classify_startup_failure(&evidence);
+        assert_eq!(
+            classification,
+            StartupFailureClassification::PromptMisdelivery
+        );
+    }
+
+    #[test]
     fn classify_startup_failure_detects_worker_crashed() {
         // Worker crashed scenario: transport healthy but MCP unhealthy
         // Don't have prompt in flight (no prompt_sent_at) to avoid matching PromptAcceptanceTimeout
         let evidence = StartupEvidenceBundle {
             last_lifecycle_state: WorkerStatus::Spawning,
+            last_lifecycle_at: 10,
             pane_command: "test".to_string(),
+            pane_observed_at: 40,
+            command_started_at: 1,
             prompt_sent_at: None, // No prompt sent yet
             prompt_acceptance_state: false,
             trust_prompt_detected: false,
+            tool_permission_prompt_detected: false,
+            tool_permission_prompt_age_seconds: None,
+            tool_permission_allow_scope: None,
             transport_healthy: true,
-            mcp_healthy: false, // MCP unhealthy but transport healthy suggests crash
+            transport_health: StartupHealthSummary::observed("transport", true),
+            mcp_healthy: false,
+            mcp_health: StartupHealthSummary::observed("mcp", false), // MCP unhealthy but transport healthy suggests crash
             elapsed_seconds: 45,
         };
 

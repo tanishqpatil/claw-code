@@ -8,6 +8,7 @@ archive/
 # Claw Code local artifacts
 .claw/settings.local.json
 .claw/sessions/
+.claw/rules.local/
 .clawhip/
 .gemini/oauth_creds.json
 status-help.txt
@@ -18,3 +19,5 @@ status-help.txt
 rust/.claw
 # Added by code-review-graph
 .code-review-graph/
+# Legacy Python port session scratch artifacts
+.port_sessions/

@@ -373,6 +373,7 @@ impl GoogleAiClient {
                             }
                         }));
                     }
+                    InputContentBlock::Thinking { .. } => {}
                 }
             }
             contents.push(json!({ "role": role, "parts": parts }));
@@ -566,6 +567,8 @@ impl GoogleAiClient {
                         request_id: None,
                         body: err_text,
                         retryable: false,
+                        suggested_action: None,
+                        retry_after: None,
                     });
                 }
 
@@ -585,6 +588,8 @@ impl GoogleAiClient {
                 request_id: None,
                 body: err_text,
                 retryable: false,
+                suggested_action: None,
+                retry_after: None,
             });
         };
 
@@ -707,6 +712,8 @@ impl GoogleAiClient {
                         request_id: None,
                         body: err_text,
                         retryable: false,
+                        suggested_action: None,
+                        retry_after: None,
                     });
                 }
 
@@ -726,6 +733,8 @@ impl GoogleAiClient {
                 request_id: None,
                 body: err_text,
                 retryable: false,
+                suggested_action: None,
+                retry_after: None,
             });
         };
 

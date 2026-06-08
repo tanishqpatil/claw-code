@@ -1532,7 +1532,7 @@ async fn stream_to_message_response(
                 usage = u;
                 stop_reason = delta.stop_reason.or(stop_reason);
             }
-            StreamEvent::MessageStop(MessageStopEvent {}) => {
+            StreamEvent::MessageStop(MessageStopEvent { .. }) => {
                 saw_stop = true;
                 break;
             }

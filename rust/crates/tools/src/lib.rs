@@ -5544,52 +5544,46 @@ fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
-    messages
-        .iter()
-        .filter_map(|message| {
-            let role = match message.role {
-                MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
-                MessageRole::Assistant => "assistant",
-            };
-            let content = message
-                .blocks
-                .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    } => InputContentBlock::Thinking {
-                        thinking: thinking.clone(),
-                        signature: signature.clone(),
-                    },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        output,
-                        is_error,
-                        ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
-                })
-                .filter(
-                    |block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()),
-                )
-                .collect::<Vec<_>>();
-            (!content.is_empty()).then(|| InputMessage {
-                role: role.to_string(),
-                content,
+    let mut converted: Vec<InputMessage> = Vec::new();
+    for message in messages {
+        let role = match message.role {
+            MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
+            MessageRole::Assistant => "assistant",
+        };
+        let content = message
+            .blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                } => InputContentBlock::Thinking {
+                    thinking: thinking.clone(),
+                    signature: signature.clone(),
+                },
+                ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: serde_json::from_str(input)
+                        .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    output,
+                    is_error,
+                    ..
+                } => InputContentBlock::ToolResult {
+                    tool_use_id: tool_use_id.clone(),
+                    content: vec![ToolResultContentBlock::Text {
+                        text: output.clone(),
+                    }],
+                    is_error: *is_error,
+                },
             })
+            .filter(
+                |block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()),
+            )
             .collect::<Vec<_>>();
 
         if content.is_empty() {
@@ -9607,7 +9601,7 @@ mod tests {
         );
 
         let summary = runtime
-            .run_turn("Inspect the delegated file", None)
+            .run_turn("Inspect the delegated file", None, &mut ())
             .expect("subagent loop should succeed");
 
         assert_eq!(

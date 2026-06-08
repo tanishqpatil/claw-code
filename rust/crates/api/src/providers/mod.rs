@@ -233,7 +233,7 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "grok-2" => "grok-2",
                     _ => trimmed,
                 },
-                ProviderKind::OpenAi | ProviderKind::Google => trimmed,
+                ProviderKind::Google => trimmed,
                 ProviderKind::OpenAi => match *alias {
                     "kimi" => "kimi-k2.5",
                     _ => trimmed,
@@ -349,6 +349,12 @@ pub fn provider_diagnostics_for_model(model: &str) -> ProviderDiagnostics {
                     base_url_env: "OPENAI_BASE_URL",
                     default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
                 },
+                ProviderKind::Google => ProviderMetadata {
+                    provider: ProviderKind::Google,
+                    auth_env: "UNUSED_OAUTH_ONLY",
+                    base_url_env: "GOOGLE_BASE_URL",
+                    default_base_url: google_ai::DEFAULT_GEMINI_BASE_URL,
+                },
             }
         });
     let openai_compatible = matches!(metadata.provider, ProviderKind::OpenAi | ProviderKind::Xai);
@@ -418,7 +424,7 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 pub const fn model_family_identity_for_kind(kind: ProviderKind) -> runtime::ModelFamilyIdentity {
     match kind {
         ProviderKind::Anthropic => runtime::ModelFamilyIdentity::Claude,
-        ProviderKind::Xai | ProviderKind::OpenAi => runtime::ModelFamilyIdentity::Generic,
+        ProviderKind::Xai | ProviderKind::OpenAi | ProviderKind::Google => runtime::ModelFamilyIdentity::Generic,
     }
 }
 
@@ -473,6 +479,15 @@ pub fn provider_capabilities_for_model(model: &str) -> ProviderCapabilityReport 
                 ProviderFeatureSupport::Unsupported
             },
             ProviderFeatureSupport::Supported,
+        ),
+        ProviderKind::Google => (
+            ProviderWireProtocol::AnthropicMessages,
+            ProviderFeatureSupport::Unsupported,
+            ProviderFeatureSupport::Unsupported,
+            ProviderFeatureSupport::Unsupported,
+            ProviderFeatureSupport::Unsupported,
+            ProviderFeatureSupport::Unsupported,
+            ProviderFeatureSupport::Unsupported,
         ),
     };
 
@@ -581,6 +596,12 @@ fn metadata_for_provider_kind(provider: ProviderKind) -> ProviderMetadata {
             base_url_env: "OPENAI_BASE_URL",
             default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
         },
+        ProviderKind::Google => ProviderMetadata {
+            provider,
+            auth_env: "UNUSED_OAUTH_ONLY",
+            base_url_env: "GOOGLE_BASE_URL",
+            default_base_url: google_ai::DEFAULT_GEMINI_BASE_URL,
+        },
     }
 }
 
@@ -590,6 +611,7 @@ const fn provider_label(provider: ProviderKind) -> &'static str {
         ProviderKind::Anthropic => "Anthropic",
         ProviderKind::Xai => "xAI",
         ProviderKind::OpenAi => "OpenAI-compatible",
+        ProviderKind::Google => "Google",
     }
 }
 

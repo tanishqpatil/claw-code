@@ -210,7 +210,7 @@ mod tests {
                         output_tokens: 2,
                     },
                 }),
-                StreamEvent::MessageStop(crate::types::MessageStopEvent {}),
+                StreamEvent::MessageStop(crate::types::MessageStopEvent { usage: None }),
             ]
         );
     }

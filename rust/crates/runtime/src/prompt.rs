@@ -38,6 +38,7 @@ impl From<ConfigError> for PromptBuildError {
 
 /// Marker separating static prompt scaffolding from dynamic runtime context.
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
+pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 const MAX_GIT_DIFF_CHARS: usize = 50_000;
@@ -251,16 +252,6 @@ impl SystemPromptBuilder {
             || "unknown".to_string(),
             |context| context.current_date.clone(),
         );
-        let family = if self.model_name.starts_with("gemini-") {
-            "Gemini Pro (Google)"
-        } else if self.model_name.starts_with("claude-") {
-            "Claude Opus 4.6"
-        } else {
-            "Claw Code Agent"
-        };
-        let mut lines = vec!["# Environment context".to_string()];
-        lines.extend(prepend_bullets(vec![
-            format!("Model family: {family}"),
         let identity = self.model_family.unwrap_or_default();
         let mut lines = vec!["# Environment context".to_string()];
         lines.extend(prepend_bullets(vec![
@@ -500,11 +491,7 @@ fn render_project_context(project_context: &ProjectContext) -> String {
     ];
     if !project_context.instruction_files.is_empty() {
         bullets.push(format!(
-<<<<<<< HEAD
-            "instruction files discovered: {}.",
-=======
             "Project instruction files discovered: {}.",
->>>>>>> 9b3548ca4337f54b001262474a35c209c17432b0
             project_context.instruction_files.len()
         ));
     }
@@ -541,11 +528,7 @@ fn render_project_context(project_context: &ProjectContext) -> String {
 }
 
 fn render_instruction_files(files: &[ContextFile]) -> String {
-<<<<<<< HEAD
-    let mut sections = vec!["# Agent instructions".to_string()];
-=======
     let mut sections = vec!["# Project instructions".to_string()];
->>>>>>> 9b3548ca4337f54b001262474a35c209c17432b0
     let mut remaining_chars = MAX_TOTAL_INSTRUCTION_CHARS;
     for file in files {
         if remaining_chars == 0 {
@@ -651,11 +634,7 @@ pub fn load_system_prompt(
     current_date: impl Into<String>,
     os_name: impl Into<String>,
     os_version: impl Into<String>,
-<<<<<<< HEAD
-    model_name: impl Into<String>,
-=======
     model_family: ModelFamilyIdentity,
->>>>>>> 9b3548ca4337f54b001262474a35c209c17432b0
 ) -> Result<Vec<String>, PromptBuildError> {
     let cwd = cwd.into();
     let (sections, _) =
@@ -673,13 +652,9 @@ pub fn load_system_prompt_with_context(
 ) -> Result<(Vec<String>, ProjectContext), PromptBuildError> {
     let cwd = cwd.into();
     let config = ConfigLoader::default_for(&cwd).load()?;
-<<<<<<< HEAD
-    Ok(SystemPromptBuilder::new(model_name)
-=======
     let project_context =
         discover_with_git_and_rules_import(&cwd, current_date.into(), config.rules_import())?;
-    let sections = SystemPromptBuilder::new()
->>>>>>> 9b3548ca4337f54b001262474a35c209c17432b0
+    let sections = SystemPromptBuilder::new(model_family.family_label())
         .with_os(os_name, os_version)
         .with_model_family(model_family)
         .with_project_context(project_context.clone())
@@ -1246,12 +1221,6 @@ mod tests {
         std::env::set_var("HOME", &root);
         std::env::set_var("CLAW_CONFIG_HOME", root.join("missing-home"));
         std::env::set_current_dir(&root).expect("change cwd");
-<<<<<<< HEAD
-        let prompt = super::load_system_prompt(&root, "2026-03-31", "linux", "6.8", "gemini-2.5-pro")
-            .expect("system prompt should load")
-            .join(
-                "
-=======
         let prompt = super::load_system_prompt(
             &root,
             "2026-03-31",
@@ -1260,12 +1229,7 @@ mod tests {
             ModelFamilyIdentity::Claude,
         )
         .expect("system prompt should load")
-        .join(
-            "
->>>>>>> 9b3548ca4337f54b001262474a35c209c17432b0
-
-",
-        );
+        .join("\n\n");
         std::env::set_current_dir(previous).expect("restore cwd");
         if let Some(value) = original_home {
             std::env::set_var("HOME", value);
@@ -1338,7 +1302,7 @@ mod tests {
         };
 
         // when: rendering the system prompt environment section
-        let prompt = SystemPromptBuilder::new()
+        let prompt = SystemPromptBuilder::new("claude-opus-4-6")
             .with_os("linux", "6.8")
             .with_project_context(project_context)
             .render();
@@ -1357,7 +1321,7 @@ mod tests {
         };
 
         // when: rendering the system prompt environment section
-        let prompt = SystemPromptBuilder::new()
+        let prompt = SystemPromptBuilder::new("claude-opus-4-6")
             .with_os("linux", "6.8")
             .with_model_family(ModelFamilyIdentity::Generic)
             .with_project_context(project_context)
@@ -1397,11 +1361,7 @@ mod tests {
 
         assert!(prompt.contains("# System"));
         assert!(prompt.contains("# Project context"));
-<<<<<<< HEAD
-        assert!(prompt.contains("# Agent instructions"));
-=======
         assert!(prompt.contains("# Project instructions"));
->>>>>>> 9b3548ca4337f54b001262474a35c209c17432b0
         assert!(prompt.contains("Project rules"));
         assert!(prompt.contains("permissionMode"));
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
@@ -1446,11 +1406,7 @@ mod tests {
             path: PathBuf::from("/tmp/project/CLAUDE.md"),
             content: "Project rules".to_string(),
         }]);
-<<<<<<< HEAD
-        assert!(rendered.contains("# Agent instructions"));
-=======
         assert!(rendered.contains("# Project instructions"));
->>>>>>> 9b3548ca4337f54b001262474a35c209c17432b0
         assert!(rendered.contains("scope: /tmp/project"));
         assert!(rendered.contains("Project rules"));
     }

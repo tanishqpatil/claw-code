@@ -171,7 +171,7 @@ struct EnvModel {
 impl ModelProvenance {
     fn default_fallback() -> Self {
         Self {
-            resolved: DEFAULT_MODEL.to_string(),
+            resolved: default_model(),
             raw: None,
             source: ModelSource::Default,
             alias_resolved_to: None,
@@ -209,7 +209,7 @@ impl ModelProvenance {
         // Only called when no --model flag was passed. Probe env first,
         // then config, else fall back to default. Mirrors the logic in
         // resolve_repl_model() but captures the source.
-        if cli_model != DEFAULT_MODEL {
+        if cli_model != default_model() {
             let provenance = Self::from_resolved(cli_model, cli_model, ModelSource::Flag, None);
             provenance.validate()?;
             return Ok(provenance);
@@ -996,7 +996,7 @@ fn plugin_load_failure_json(failure: &plugins::PluginLoadFailure) -> Value {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Load .env file and populate std::env so all subsequent std::env::var() calls work
-    if let Some(path) = find_dotenv_path() {
+    if let Some(path) = api::find_dotenv_path() {
         if let Some(env_map) = api::load_dotenv_file(&path) {
             for (k, v) in env_map {
                 if std::env::var(&k).is_err() {
@@ -1047,7 +1047,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             cwd,
             date,
-            model,
             output_format,
         } => print_system_prompt(cwd, date, &model, output_format)?,
         CliAction::Version { output_format } => print_version(output_format)?,
@@ -1099,9 +1098,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
             let resolved_model = resolve_repl_model(model)?;
-            let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+            let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode, None)?;
             cli.set_reasoning_effort(reasoning_effort);
-            cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
+            let mut renderer = TerminalRenderer::new();
+            cli.run_turn_with_output(&effective_prompt, output_format, compact, &mut renderer)?;
         }
         CliAction::Doctor {
             output_format,
@@ -1207,7 +1207,6 @@ enum CliAction {
         model: String,
         cwd: PathBuf,
         date: String,
-        model: String,
         output_format: CliOutputFormat,
     },
     Version {
@@ -1492,7 +1491,7 @@ impl CliOutputFormat {
 
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    let mut model = DEFAULT_MODEL.to_string();
+    let mut model = default_model();
     // #148: when user passes --model/--model=, capture the raw input so we
     // can attribute source: "flag" later. None means no flag was supplied.
     let mut model_flag_raw: Option<String> = None;
@@ -3179,7 +3178,6 @@ fn filter_tool_specs(
 }
 
 fn parse_system_prompt_args(
-    model: String,
     args: &[String],
     model: String,
     output_format: CliOutputFormat,
@@ -3249,7 +3247,6 @@ fn parse_system_prompt_args(
         model,
         cwd,
         date,
-        model,
         output_format,
     })
 }
@@ -4929,7 +4926,6 @@ fn bootstrap_phase_metadata(phase: &runtime::BootstrapPhase) -> (&'static str, &
 }
 
 fn print_system_prompt(
-    model: &str,
     cwd: PathBuf,
     date: String,
     model: &str,
@@ -6866,14 +6862,14 @@ fn run_resume_command(
                 session: session.clone(),
                 message: Some(format!(
                     "Models\n  Default          {}\n  Config model     {}",
-                    DEFAULT_MODEL,
+                    default_model(),
                     configured_model.as_deref().unwrap_or("<unset>")
                 )),
                 json: Some(serde_json::json!({
                     "kind": "models",
                     "action": "list",
                     "status": "ok",
-                    "default_model": DEFAULT_MODEL,
+                    "default_model": default_model(),
                     "configured_model": configured_model,
                     "resolved_model": resolved_config_model,
                     "requested_model": model,
@@ -7056,7 +7052,7 @@ fn run_repl(
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model)?;
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode, git_branch.clone())?;
     cli.set_reasoning_effort(reasoning_effort);
 
     let mut renderer = TerminalRenderer::new();
@@ -7935,7 +7931,7 @@ impl LiveCli {
                         drop(hook_abort_monitor);
 
                         let mut rp = CliPermissionPrompter::new(self.permission_mode);
-                        match new_runtime.run_turn(input, Some(&mut rp)) {
+                        match new_runtime.run_turn(input, Some(&mut rp), &mut ()) {
                             Ok(summary) => {
                                 self.replace_runtime(new_runtime)?;
                                 spinner.finish(
@@ -8014,8 +8010,8 @@ impl LiveCli {
     ) -> Result<(), Box<dyn std::error::Error>> {
         match output_format {
             CliOutputFormat::Json if compact => self.run_prompt_compact_json(input),
-            CliOutputFormat::Text if compact => self.run_prompt_compact(input),
-            CliOutputFormat::Text => self.run_turn(input),
+            CliOutputFormat::Text if compact => self.run_prompt_compact(input, renderer),
+            CliOutputFormat::Text => self.run_turn(input, renderer),
             CliOutputFormat::Json => self.run_prompt_json(input),
         }
     }
@@ -8040,7 +8036,7 @@ impl LiveCli {
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let result = runtime.run_turn(input, Some(&mut permission_prompter), &mut ());
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
@@ -8065,7 +8061,7 @@ impl LiveCli {
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter), renderer);
+        let result = runtime.run_turn(input, Some(&mut permission_prompter), &mut ());
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
@@ -10364,7 +10360,7 @@ fn print_models(
     match output_format {
         CliOutputFormat::Text => {
             println!("Models");
-            println!("  Default          {DEFAULT_MODEL}");
+            println!("  Default          {}", default_model());
             println!("  Built-in aliases opus, sonnet, haiku");
             if let Some(raw) = configured_model.as_deref() {
                 println!(
@@ -10387,7 +10383,7 @@ fn print_models(
                     "kind": "models",
                     "action": "list",
                     "status": "ok",
-                    "default_model": DEFAULT_MODEL,
+                    "default_model": default_model(),
                     "aliases": [
                         {"name": "opus", "model": resolve_model_alias("opus")},
                         {"name": "sonnet", "model": resolve_model_alias("sonnet")},
@@ -14065,57 +14061,51 @@ fn permission_policy(
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
-    messages
-        .iter()
-        .filter_map(|message| {
-            let role = match message.role {
-                MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
-                MessageRole::Assistant => "assistant",
-            };
-            let content = message
-                .blocks
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => {
-                        Some(InputContentBlock::Text { text: text.clone() })
-                    }
-                    ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    } => {
-                        // 保留 Thinking 块：OpenAI 兼容协议会把它转成 reasoning_content 字段
-                        // 回传给 DeepSeek V4（避免 400 "reasoning_content must be passed back" 错误）
-                        Some(InputContentBlock::Thinking {
-                            thinking: thinking.clone(),
-                            signature: signature.clone(),
-                        })
-                    }
-                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    }),
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        output,
-                        is_error,
-                        ..
-                    } => Some(InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    }),
-                })
-                .collect::<Vec<_>>();
-            (!content.is_empty()).then(|| InputMessage {
-                role: role.to_string(),
-                content,
+    let mut converted: Vec<InputMessage> = Vec::new();
+    for message in messages {
+        let role = match message.role {
+            MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
+            MessageRole::Assistant => "assistant",
+        };
+        let content = message
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => {
+                    Some(InputContentBlock::Text { text: text.clone() })
+                }
+                ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                } => {
+                    // 保留 Thinking 块：OpenAI 兼容协议会把它转成 reasoning_content 字段
+                    // 回传给 DeepSeek V4（避免 400 "reasoning_content must be passed back" 错误）
+                    Some(InputContentBlock::Thinking {
+                        thinking: thinking.clone(),
+                        signature: signature.clone(),
+                    })
+                }
+                ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: serde_json::from_str(input)
+                        .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+                }),
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    output,
+                    is_error,
+                    ..
+                } => Some(InputContentBlock::ToolResult {
+                    tool_use_id: tool_use_id.clone(),
+                    content: vec![ToolResultContentBlock::Text {
+                        text: output.clone(),
+                    }],
+                    is_error: *is_error,
+                }),
             })
             .collect::<Vec<_>>();
-        })
+
         if content.is_empty() {
             continue;
         }

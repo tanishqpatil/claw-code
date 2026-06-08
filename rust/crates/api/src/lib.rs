@@ -30,6 +30,7 @@ pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
     model_family_identity_for, model_family_identity_for_kind, provider_diagnostics_for_model,
     resolve_model_alias, ProviderDiagnostics, ProviderKind,
+    find_dotenv_path, load_dotenv_file, model_token_limit,
 };
 pub use sse::{parse_frame, SseParser};
 pub use types::{
